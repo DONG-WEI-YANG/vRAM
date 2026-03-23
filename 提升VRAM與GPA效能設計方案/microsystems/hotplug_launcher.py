@@ -504,7 +504,7 @@ class BoosterApp:
 
     def _quick_estimate(self, info: Dict) -> Dict:
         from .core.slow_device_optimizer import SlowDeviceProfile
-        from .core.real_boost import SWAP_LIMIT_BY_RAND_WRITE_MBS
+        from .core.real_boost import SWAP_FILL_TIME_SECONDS
 
         profile_map = {
             "sd_express": None, "nvme_enclosure": None, "usb_ssd": None,
@@ -522,12 +522,8 @@ class BoosterApp:
             bw = eff["rand_read_mbs"]
             rand_write = eff["rand_write_mbs"]
 
-            # 計算 swap 大小上限
-            swap_limit_gb = 0
-            for threshold, max_bytes in SWAP_LIMIT_BY_RAND_WRITE_MBS:
-                if rand_write >= threshold:
-                    swap_limit_gb = max_bytes / (1024 ** 3) if max_bytes > 0 else 0
-                    break
+            # 連續公式：swap 上限 = 速度 × 可接受寫滿時間
+            swap_limit_gb = rand_write * SWAP_FILL_TIME_SECONDS / 1024
 
         free = info.get("free_gb", 0)
         # swap 容量 = min(可用空間 × 80%, 速度上限)

@@ -35,15 +35,11 @@ from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 根據隨機寫入速度決定 swap 大小上限
-# swap/pagefile 是隨機 4KB 頁面 I/O，不是順序讀寫
-SWAP_LIMIT_BY_RAND_WRITE_MBS = [
-    # (rand_write_mbs 下限, swap 上限 bytes)
-    (200, 0),                    # >= 200 MB/s → 不限制 (用 0 表示)
-    (50,  128 * (1024 ** 3)),    # >= 50  MB/s → 最大 128 GB
-    (10,  32 * (1024 ** 3)),     # >= 10  MB/s → 最大 32 GB
-    (0,   8 * (1024 ** 3)),      # <  10  MB/s → 最大 8 GB (SD UHS-I 等)
-]
+# swap 大小 = 實測隨機寫入速度 × 可接受的最大寫滿秒數
+# 原理：OS 高壓 swap 時可能寫滿整個 swap 空間，
+#       寫滿時間過長 → 用戶感覺系統凍結。
+SWAP_FILL_TIME_SECONDS = 600  # 10 分鐘內能寫滿 = 可接受的上限
+SWAP_MIN_BYTES = 512 * (1024 ** 2)  # 最小 512 MB（太小沒意義）
 
 
 class RealBoostEngine:
@@ -139,27 +135,28 @@ class RealBoostEngine:
 
     def _cap_swap_by_speed(self, swap_bytes: int) -> Tuple[int, str]:
         """
-        根據實測隨機寫入速度限制 swap 大小。
+        根據實測隨機寫入速度動態計算 swap 大小上限。
+
+        公式：max_swap = 速度 (MB/s) × 可接受寫滿時間 (秒)
+        例：5 MB/s × 600s = 3 GB, 50 MB/s × 600s = 30 GB, 200 MB/s × 600s = 120 GB
+
         Returns: (capped_bytes, warning_message or "")
         """
         speed = self._measured_rand_write_mbs
+        max_bytes = int(speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS)
+        max_bytes = max(max_bytes, SWAP_MIN_BYTES)
 
-        for threshold, max_bytes in SWAP_LIMIT_BY_RAND_WRITE_MBS:
-            if speed >= threshold:
-                if max_bytes == 0:
-                    return swap_bytes, ""  # 不限制
-                if swap_bytes <= max_bytes:
-                    return swap_bytes, ""  # 未超過上限
-                capped_gb = max_bytes / (1024 ** 3)
-                original_gb = swap_bytes / (1024 ** 3)
-                warning = (
-                    f"裝置隨機寫入 {speed:.0f} MB/s，swap 從 {original_gb:.0f}GB "
-                    f"限制到 {capped_gb:.0f}GB 以避免系統凍結"
-                )
-                logger.warning(warning)
-                return max_bytes, warning
+        if swap_bytes <= max_bytes:
+            return swap_bytes, ""
 
-        return swap_bytes, ""
+        capped_gb = max_bytes / (1024 ** 3)
+        original_gb = swap_bytes / (1024 ** 3)
+        warning = (
+            f"裝置隨機寫入 {speed:.0f} MB/s → swap 上限 {capped_gb:.1f}GB "
+            f"(原 {original_gb:.0f}GB，依速度自動調配)"
+        )
+        logger.warning(warning)
+        return max_bytes, warning
 
     def deactivate(self) -> Dict[str, Any]:
         """移除 swap/pagefile，恢復原狀"""
