@@ -230,19 +230,27 @@ class RealBoostEngine:
 
         if cached:
             cached_speed = cached.get("rand_write_mbs", 0)
-            report(f"讀取上次記錄：{cached_speed:.0f} MB/s，快速驗證中...")
+            report(f"reading cache: {cached_speed:.0f} MB/s, verifying...")
 
-            # 快速驗證：256KB 測速 < 1 秒
-            quick_speed = self._quick_speed_check(mount)
-            drift = abs(quick_speed - cached_speed) / max(cached_speed, 1)
+            # 快速驗證：256KB，最多等 10 秒，超時就直接用快取
+            import concurrent.futures
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(self._quick_speed_check, mount)
+                    quick_speed = future.result(timeout=10)
 
-            if drift <= self.SPEED_DRIFT_THRESHOLD:
-                # 速度穩定，使用快取
+                drift = abs(quick_speed - cached_speed) / max(cached_speed, 1)
+                if drift <= self.SPEED_DRIFT_THRESHOLD:
+                    self._measured_rand_write_mbs = cached_speed
+                    report(f"speed OK ({quick_speed:.0f} ~ {cached_speed:.0f} MB/s)")
+                    need_full_benchmark = False
+                else:
+                    report(f"speed changed ({quick_speed:.0f} vs {cached_speed:.0f} MB/s), re-testing...")
+            except (concurrent.futures.TimeoutError, OSError):
+                # 快速驗證卡住（SD 卡 GC 中），直接用快取值
                 self._measured_rand_write_mbs = cached_speed
-                report(f"速度穩定（{quick_speed:.0f} ≈ {cached_speed:.0f} MB/s），使用上次設定")
+                report(f"verify timeout, using cached {cached_speed:.0f} MB/s")
                 need_full_benchmark = False
-            else:
-                report(f"速度變化較大（{quick_speed:.0f} vs {cached_speed:.0f} MB/s），重新完整測速...")
 
         if need_full_benchmark:
             # 完整測速：4MB 隨機寫入
