@@ -581,22 +581,13 @@ class BoosterApp:
 
                     if result.get("success"):
                         added = result.get("added_gb", 0)
-                        reused = result.get("reused", False)
                         rand_mbs = result.get("rand_write_mbs", 0)
-                        label_text = "快速啟動" if reused else "已建立"
-                        self._system_name = f"+{added:.0f} GB ({label_text})"
                         self._system = True
-                        self._engine_ready.set()  # 標記 engine 可用
+                        self._engine_ready.set()
 
-                        if hasattr(self, '_info_lbls'):
-                            self._root.after(0, lambda: self._info_lbls["system"].configure(
-                                text=self._system_name))
-                            if result.get("warning"):
-                                self._root.after(0, lambda: self._health_lbl.configure(
-                                    text=f">> {rand_mbs:.0f} MB/s", fg=self.ORANGE))
-                            else:
-                                self._root.after(0, lambda: self._health_lbl.configure(
-                                    text=">> active", fg=self.GREEN))
+                        # 切換到「成功 + 重開機提示」畫面
+                        self._root.after(0, lambda: self._show_reboot_prompt(
+                            added, rand_mbs, result.get("warning", "")))
                     else:
                         error = result.get("error", "Unknown")
                         if hasattr(self, '_health_lbl'):
@@ -634,6 +625,73 @@ class BoosterApp:
             logger.warning("Deactivate timed out after 5s, forcing exit")
 
         self._system = None
+        if self._root:
+            self._root.destroy()
+
+    # ── Phase 4: 成功 + 重開機提示 ──
+
+    def _show_reboot_prompt(self, added_gb: float, rand_mbs: float, warning: str):
+        """Registry pagefile 註冊成功，提示重開機"""
+        self._clear()
+        self._phase = "done"
+
+        # 調整視窗大小
+        self._root.geometry(f"360x300+{self._root.winfo_x()}+{self._root.winfo_y()}")
+
+        tk.Label(self._frame, text="VRAM Booster", font=("Segoe UI", 14, "bold"),
+                 fg=self.ACCENT, bg=self.BG).pack(pady=(20, 8))
+
+        # 成功訊息
+        tk.Label(self._frame, text="Pagefile registered!", font=("Segoe UI", 12, "bold"),
+                 fg=self.GREEN, bg=self.BG).pack(pady=(0, 10))
+
+        # 資訊卡
+        card = tk.Frame(self._frame, bg=self.BG2, padx=15, pady=10)
+        card.pack(fill="x", padx=15, pady=5)
+
+        rows = [
+            ("Swap", f"+{added_gb:.1f} GB", self.GREEN),
+            ("Speed", f"{rand_mbs:.0f} MB/s (random write)", self.FG),
+            ("Drive", f"{self._my_drive}:\\", self.FG),
+        ]
+        if warning:
+            rows.append(("Note", warning, self.ORANGE))
+
+        for lbl, val, fg in rows:
+            r = tk.Frame(card, bg=self.BG2)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=f"{lbl}:", font=("Segoe UI", 9),
+                     fg=self.GRAY, bg=self.BG2, width=6, anchor="e").pack(side="left")
+            tk.Label(r, text=val, font=("Segoe UI", 9, "bold"),
+                     fg=fg, bg=self.BG2, anchor="w").pack(side="left", padx=(8, 0))
+
+        # 重開機提示
+        tk.Label(self._frame,
+                 text="Reboot to activate pagefile",
+                 font=("Segoe UI", 10), fg=self.ORANGE, bg=self.BG).pack(pady=(12, 8))
+
+        # 按鈕
+        btn_f = tk.Frame(self._frame, bg=self.BG)
+        btn_f.pack(pady=5)
+        tk.Button(btn_f, text=" Reboot Now ", font=("Segoe UI", 10, "bold"),
+                  fg="white", bg="#00c853", activebackground=self.GREEN,
+                  relief="flat", cursor="hand2", padx=16, pady=4,
+                  command=self._reboot).pack(side="left", padx=8)
+        tk.Button(btn_f, text=" Later ", font=("Segoe UI", 10),
+                  fg=self.GRAY, bg="#333333", activebackground="#444444",
+                  relief="flat", cursor="hand2", padx=16, pady=4,
+                  command=self._quit).pack(side="left", padx=8)
+
+    def _reboot(self):
+        """觸發 Windows/Linux 重開機"""
+        self._running = False
+        try:
+            if platform.system().lower() == "windows":
+                _run_hidden(["shutdown", "/r", "/t", "5", "/c", "VRAM Booster: activating pagefile"])
+            else:
+                _run_hidden(["shutdown", "-r", "+0"])
+        except OSError as e:
+            logger.error("Reboot failed: %s", e)
         if self._root:
             self._root.destroy()
 
