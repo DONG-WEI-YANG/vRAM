@@ -1,4 +1,4 @@
-"""
+r"""
 VRAM Booster — 通用隨插即用啟動器
 ====================================
 一個 .exe 通吃六種設備。
@@ -224,6 +224,8 @@ class BoosterApp:
         self._root: Optional[tk.Tk] = None
         self._running = True
         self._phase = "detecting"  # detecting → confirm → active
+        self._engine_lock = threading.Lock()  # 防止 activate/deactivate 競態
+        self._engine_ready = threading.Event()  # engine 初始化完成信號
 
     def run(self):
         # 降低自身程序優先權，避免監控佔用前景資源
@@ -406,8 +408,8 @@ class BoosterApp:
             self._quit()  # 拔卡 → 退出
             return
 
-        # 更新監控 — 真實系統記憶體數據
-        if self._system and hasattr(self, '_boost_engine') and self._boost_engine:
+        # 等 engine 初始化完成才讀取狀態（防競態）
+        if self._engine_ready.is_set() and self._boost_engine:
             try:
                 from .core.real_boost import RealBoostEngine
                 status = self._boost_engine.status()
@@ -430,7 +432,6 @@ class BoosterApp:
                     self._bars[i]["fill"].place(x=0, y=0, width=fw, relheight=1.0)
                     self._bars[i]["text"].configure(text=f"{used:.1f} / {cap:.1f} GB")
 
-                total = status["total_usable_gb"]
                 self._info_lbls["total"].configure(
                     text=f"{status['physical_ram_gb']:.0f} GB RAM + {status['swap_total_gb']:.0f} GB Swap")
                 self._info_lbls["compress"].configure(text=f"GPU: {gpu['name']}")
@@ -438,8 +439,8 @@ class BoosterApp:
                     text=f"VRAM: {gpu['vram_free_mb']}MB free")
                 self._info_lbls["device"].configure(text=f"{self._my_drive}:\\")
 
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError) as e:
+                logger.debug("Poll error: %s", e)
 
         self._root.after(10000, self._poll_monitor)  # 10 秒輪詢，減少資源佔用
 
@@ -448,61 +449,81 @@ class BoosterApp:
     def _activate(self):
         self._show_active()
         self._boost_engine = None
+        self._engine_ready.clear()
 
         def do():
-            try:
-                from .core.real_boost import RealBoostEngine
+            with self._engine_lock:
+                try:
+                    from .core.real_boost import RealBoostEngine
 
-                engine = RealBoostEngine()
-                self._boost_engine = engine
-                info = self._device_info
+                    engine = RealBoostEngine()
+                    self._boost_engine = engine
+                    info = self._device_info
 
-                # 進度回報：從背景執行緒安全更新 tkinter UI
-                def on_progress(msg: str):
-                    if hasattr(self, '_health_lbl') and self._root:
-                        self._root.after(0, lambda: self._health_lbl.configure(
-                            text=f"⏳ {msg}", fg=self.ORANGE))
+                    # 進度回報：從背景執行緒安全更新 tkinter UI
+                    def on_progress(msg: str):
+                        if hasattr(self, '_health_lbl') and self._root:
+                            self._root.after(0, lambda: self._health_lbl.configure(
+                                text=f">> {msg}", fg=self.ORANGE))
 
-                # 真實擴展：在裝置上建立 swap/pagefile
-                result = engine.activate(info["letter"], use_percent=80.0,
-                                         on_progress=on_progress)
+                    # 真實擴展：在裝置上建立 swap/pagefile
+                    result = engine.activate(info["letter"], use_percent=80.0,
+                                             on_progress=on_progress)
 
-                if result.get("success"):
-                    added = result.get("added_gb", 0)
-                    reused = result.get("reused", False)
-                    rand_mbs = result.get("rand_write_mbs", 0)
-                    label = "快速啟動" if reused else "已建立"
-                    self._system_name = f"+{added:.0f} GB ({label})"
-                    self._system = True  # 標記為已啟動
+                    if result.get("success"):
+                        added = result.get("added_gb", 0)
+                        reused = result.get("reused", False)
+                        rand_mbs = result.get("rand_write_mbs", 0)
+                        label_text = "快速啟動" if reused else "已建立"
+                        self._system_name = f"+{added:.0f} GB ({label_text})"
+                        self._system = True
+                        self._engine_ready.set()  # 標記 engine 可用
 
-                    if hasattr(self, '_info_lbls'):
-                        self._info_lbls["system"].configure(text=self._system_name)
-                        # 有速度警告時顯示橙色
-                        if result.get("warning"):
-                            self._health_lbl.configure(
-                                text=f"● 運作中 (寫入 {rand_mbs:.0f} MB/s)", fg=self.ORANGE)
-                        else:
-                            self._health_lbl.configure(text="● 運作中", fg=self.GREEN)
-                else:
-                    error = result.get("error", "Unknown")
+                        if hasattr(self, '_info_lbls'):
+                            self._root.after(0, lambda: self._info_lbls["system"].configure(
+                                text=self._system_name))
+                            if result.get("warning"):
+                                self._root.after(0, lambda: self._health_lbl.configure(
+                                    text=f">> {rand_mbs:.0f} MB/s", fg=self.ORANGE))
+                            else:
+                                self._root.after(0, lambda: self._health_lbl.configure(
+                                    text=">> active", fg=self.GREEN))
+                    else:
+                        error = result.get("error", "Unknown")
+                        if hasattr(self, '_health_lbl'):
+                            self._root.after(0, lambda: self._health_lbl.configure(
+                                text=f">> {error}", fg=self.RED))
+
+                except (ImportError, OSError, ValueError) as e:
+                    logger.error("Activation failed: %s", e)
                     if hasattr(self, '_health_lbl'):
-                        self._health_lbl.configure(text=f"● {error}", fg=self.RED)
-
-            except Exception as e:
-                logger.error("Activation failed: %s", e)
-                if hasattr(self, '_health_lbl'):
-                    self._health_lbl.configure(text="● 失敗", fg=self.RED)
+                        self._root.after(0, lambda: self._health_lbl.configure(
+                            text=">> failed", fg=self.RED))
 
         threading.Thread(target=do, daemon=True).start()
 
     def _quit(self):
         self._running = False
-        # 停止真實的 swap/pagefile — 移除裝置上的 swap 檔案
-        if hasattr(self, '_boost_engine') and self._boost_engine:
+
+        def shutdown():
+            # 用 lock 確保不會跟 activate 同時跑
+            acquired = self._engine_lock.acquire(timeout=5)
             try:
-                self._boost_engine.deactivate()
-            except Exception:
-                pass
+                if self._boost_engine:
+                    self._boost_engine.deactivate()
+            except (OSError, subprocess.TimeoutExpired) as e:
+                logger.warning("Deactivate error: %s", e)
+            finally:
+                if acquired:
+                    self._engine_lock.release()
+
+        # 在背景執行關機，最多等 5 秒
+        t = threading.Thread(target=shutdown, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            logger.warning("Deactivate timed out after 5s, forcing exit")
+
         self._system = None
         if self._root:
             self._root.destroy()
@@ -577,10 +598,59 @@ class BoosterApp:
         }
 
 
+# ── UAC Elevation ──
+
+def _is_admin() -> bool:
+    """檢查是否以管理員身份執行"""
+    if platform.system().lower() != "windows":
+        return os.geteuid() == 0
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except (AttributeError, OSError):
+        return False
+
+
+def _elevate_and_restart():
+    """用 UAC 對話框重新啟動自己（僅 Windows）"""
+    try:
+        import ctypes
+        exe = sys.executable if not getattr(sys, 'frozen', False) else sys.argv[0]
+        params = " ".join(sys.argv[1:])
+        # ShellExecuteW with "runas" triggers UAC prompt
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+    except (AttributeError, OSError):
+        pass
+
+
 # ── Entry Point ──
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    # 持久化 log 到 exe 所在目錄（SD 卡上）
+    log_handlers = [logging.StreamHandler()]
+    try:
+        if getattr(sys, 'frozen', False):
+            log_dir = Path(sys.executable).parent
+        else:
+            log_dir = Path(__file__).parent
+        log_file = log_dir / "vram_booster.log"
+        log_handlers.append(logging.FileHandler(str(log_file), encoding="utf-8"))
+    except OSError:
+        pass
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=log_handlers,
+    )
+
+    # Windows: 需要管理員權限才能建 pagefile，自動提權
+    if platform.system().lower() == "windows" and not _is_admin():
+        logger.info("Not admin, requesting elevation...")
+        _elevate_and_restart()
+        sys.exit(0)
+
     app = BoosterApp()
     app.run()
 

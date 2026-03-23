@@ -90,7 +90,7 @@ class RealBoostEngine:
                 )
                 if r.returncode == 0:
                     label = r.stdout.strip()
-            except Exception:
+            except (subprocess.TimeoutExpired, OSError):
                 pass
 
         return f"{total_gb}GB|{label}"
@@ -135,6 +135,32 @@ class RealBoostEngine:
     def _quick_speed_check(self, mount_path: str) -> float:
         """快速驗證（256KB），確認裝置速度沒有大幅變化"""
         return self._benchmark_random_write(mount_path, test_size_mb=0.25)
+
+    @staticmethod
+    def _verify_swap_file(swap_path: Path) -> bool:
+        """
+        驗證 swap 檔案完整性：讀寫頭尾各 4KB。
+        損壞或不可存取的檔案會被刪除，觸發重建。
+        """
+        try:
+            size = swap_path.stat().st_size
+            if size < 512 * (1024 ** 2):
+                return False
+            with open(swap_path, "r+b") as f:
+                # 讀頭部
+                f.seek(0)
+                f.read(4096)
+                # 讀尾部
+                f.seek(max(0, size - 4096))
+                f.read(4096)
+            return True
+        except OSError:
+            logger.warning("Swap file integrity check failed, will recreate: %s", swap_path)
+            try:
+                swap_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     def activate(self, drive_letter: str, use_percent: float = 80.0,
                  on_progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
@@ -338,7 +364,7 @@ class RealBoostEngine:
                 mem["swap_total"] = stat.ullTotalPageFile - stat.ullTotalPhys
                 swap_free = stat.ullAvailPageFile - stat.ullAvailPhys
                 mem["swap_used"] = max(0, mem["swap_total"] - swap_free)
-            except Exception:
+            except (OSError, AttributeError, ValueError):
                 pass
         else:
             try:
@@ -354,7 +380,7 @@ class RealBoostEngine:
                         elif parts[0] == "SwapFree:":
                             swap_free = int(parts[1]) * 1024
                             mem["swap_used"] = mem["swap_total"] - swap_free
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
         return mem
@@ -407,14 +433,13 @@ class RealBoostEngine:
         swap_path_str = f"{letter}:\\{self.SWAP_FILENAME}"
         swap_path = Path(swap_path_str)
 
-        # 檢查上次的 swap 檔案是否還在
+        # 檢查上次的 swap 檔案是否還在且完整
         reuse = False
-        if swap_path.exists():
+        if swap_path.exists() and self._verify_swap_file(swap_path):
             existing_size = swap_path.stat().st_size
-            if existing_size >= 512 * (1024 ** 2):
-                swap_bytes = existing_size
-                reuse = True
-                report(f"偵測到上次的 swap 檔案（{existing_size // (1024**3)}GB），直接註冊...")
+            swap_bytes = existing_size
+            reuse = True
+            report(f"swap ({existing_size // (1024**3)}GB) verify OK")
 
         if not reuse:
             # 計算 swap 大小 (可用空間的 use_pct%)
@@ -498,8 +523,8 @@ class RealBoostEngine:
                      "if ($pf) { $pf.Delete() }"],
                     capture_output=True, timeout=10,
                 )
-            except Exception:
-                pass
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning("Pagefile deregistration error: %s", e)
 
             # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
             logger.info("Pagefile unregistered, file kept for reuse: %s", self._swap_path)
@@ -523,14 +548,13 @@ class RealBoostEngine:
 
         swap_path = Path(mount_point) / self.SWAP_FILENAME
 
-        # 檢查上次的 swap 檔案是否還在
+        # 檢查上次的 swap 檔案是否還在且完整
         reuse = False
-        if swap_path.exists():
+        if swap_path.exists() and self._verify_swap_file(swap_path):
             existing_size = swap_path.stat().st_size
-            if existing_size >= 512 * (1024 ** 2):
-                swap_bytes = existing_size
-                reuse = True
-                report(f"偵測到上次的 swap 檔案（{existing_size // (1024**3)}GB），直接啟用...")
+            swap_bytes = existing_size
+            reuse = True
+            report(f"swap ({existing_size // (1024**3)}GB) verify OK")
 
         if not reuse:
             swap_bytes = int(usage.free * (use_pct / 100))
@@ -589,8 +613,8 @@ class RealBoostEngine:
                 subprocess.run(["swapoff", str(self._swap_path)], capture_output=True, timeout=30)
                 # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
                 logger.info("Swap disabled, file kept for reuse: %s", self._swap_path)
-            except Exception:
-                pass
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning("Swapoff error: %s", e)
 
         self._active = False
         self._swap_path = None
