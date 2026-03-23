@@ -31,7 +31,7 @@ import subprocess
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,8 @@ class RealBoostEngine:
         self._original_mem: Dict[str, int] = {}
         self._measured_rand_write_mbs: float = 0.0
 
-    def activate(self, drive_letter: str, use_percent: float = 80.0) -> Dict[str, Any]:
+    def activate(self, drive_letter: str, use_percent: float = 80.0,
+                 on_progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
         """
         在指定磁碟上建立 swap/pagefile，立即擴展系統記憶體。
 
@@ -71,25 +72,36 @@ class RealBoostEngine:
         Args:
             drive_letter: 磁碟代號 (e.g., "E")
             use_percent: 使用可用空間的百分比 (預設 80%)
+            on_progress: 進度回報函式 (message: str) → None，供 GUI 更新狀態
 
         Returns: {"success": bool, "added_gb": float, "total_mem_gb": float, ...}
         """
         if self._active:
             return {"success": False, "error": "Already active"}
 
+        def report(msg: str):
+            if on_progress:
+                on_progress(msg)
+            logger.info(msg)
+
         # 記錄原始記憶體
+        report("讀取系統記憶體...")
         self._original_mem = self.get_system_memory()
         self._device_letter = drive_letter
 
         # 測速：用 4MB 隨機寫入測試裝置真實效能
+        report("測試裝置速度（約 3-5 秒）...")
         mount = f"{drive_letter}:\\" if self._is_windows else drive_letter
         self._measured_rand_write_mbs = self._benchmark_random_write(mount)
-        logger.info("Device speed test: random write = %.1f MB/s", self._measured_rand_write_mbs)
+        report(f"測速完成：隨機寫入 {self._measured_rand_write_mbs:.0f} MB/s")
+
+        # 計算 swap 大小
+        report("計算最佳 swap 大小...")
 
         if self._is_windows:
-            return self._activate_windows(drive_letter, use_percent)
+            return self._activate_windows(drive_letter, use_percent, report)
         else:
-            return self._activate_linux(drive_letter, use_percent)
+            return self._activate_linux(drive_letter, use_percent, report)
 
     @staticmethod
     def _benchmark_random_write(mount_path: str, test_size_mb: int = 4) -> float:
@@ -249,8 +261,10 @@ class RealBoostEngine:
 
     # ── Windows: Pagefile ──
 
-    def _activate_windows(self, letter: str, use_pct: float) -> Dict[str, Any]:
+    def _activate_windows(self, letter: str, use_pct: float,
+                          report=None) -> Dict[str, Any]:
         """在 Windows 上建立 pagefile"""
+        report = report or (lambda msg: None)
         mount = f"{letter}:\\"
         try:
             usage = shutil.disk_usage(mount)
@@ -269,6 +283,7 @@ class RealBoostEngine:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
 
         swap_path = f"{letter}:\\{self.SWAP_FILENAME}"
+        report(f"建立 pagefile ({swap_mb // 1024}GB)...")
 
         try:
             # 用 wmic 建立 pagefile (需要管理員權限)
@@ -349,8 +364,10 @@ class RealBoostEngine:
 
     # ── Linux: Swap File ──
 
-    def _activate_linux(self, mount_point: str, use_pct: float) -> Dict[str, Any]:
+    def _activate_linux(self, mount_point: str, use_pct: float,
+                        report=None) -> Dict[str, Any]:
         """在 Linux 上建立 swap file"""
+        report = report or (lambda msg: None)
         try:
             usage = shutil.disk_usage(mount_point)
         except OSError as e:
@@ -368,13 +385,16 @@ class RealBoostEngine:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB"}
 
         try:
-            # 建立 swap 檔案
+            report(f"建立 swap 檔案 ({swap_mb // 1024}GB)，請稍候...")
             subprocess.run(
                 ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
                 capture_output=True, timeout=300, check=True,
             )
+            report("設定 swap 權限...")
             subprocess.run(["chmod", "600", str(swap_path)], check=True)
+            report("格式化 swap...")
             subprocess.run(["mkswap", str(swap_path)], capture_output=True, check=True)
+            report("啟用 swap...")
             subprocess.run(["swapon", str(swap_path)], capture_output=True, check=True)
 
             self._swap_path = swap_path

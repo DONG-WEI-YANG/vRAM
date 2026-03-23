@@ -454,8 +454,15 @@ class BoosterApp:
                 self._boost_engine = engine
                 info = self._device_info
 
+                # 進度回報：從背景執行緒安全更新 tkinter UI
+                def on_progress(msg: str):
+                    if hasattr(self, '_health_lbl') and self._root:
+                        self._root.after(0, lambda: self._health_lbl.configure(
+                            text=f"⏳ {msg}", fg=self.ORANGE))
+
                 # 真實擴展：在裝置上建立 swap/pagefile
-                result = engine.activate(info["letter"], use_percent=80.0)
+                result = engine.activate(info["letter"], use_percent=80.0,
+                                         on_progress=on_progress)
 
                 if result.get("success"):
                     added = result.get("added_gb", 0)
