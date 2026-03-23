@@ -52,6 +52,9 @@ class RealBoostEngine:
     """
 
     SWAP_FILENAME = "vram_boost.swap"
+    CONFIG_FILENAME = ".vram_boost_config.json"
+    # 快速驗證用：寫入 256KB 測速，若與記錄差異超過此比例則重測
+    SPEED_DRIFT_THRESHOLD = 0.3  # 30%
 
     def __init__(self):
         self._is_windows = platform.system().lower() == "windows"
@@ -62,12 +65,46 @@ class RealBoostEngine:
         self._original_mem: Dict[str, int] = {}
         self._measured_rand_write_mbs: float = 0.0
 
+    # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
+
+    def _load_cached_config(self, mount_path: str) -> Optional[Dict[str, Any]]:
+        """讀取 SD 卡上的快取設定"""
+        config_path = Path(mount_path) / self.CONFIG_FILENAME
+        if not config_path.exists():
+            return None
+        try:
+            import json
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if "rand_write_mbs" in data and "swap_size_bytes" in data:
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    def _save_config(self, mount_path: str, config: Dict[str, Any]) -> None:
+        """將設定存到 SD 卡，下次插入可直接使用"""
+        config_path = Path(mount_path) / self.CONFIG_FILENAME
+        try:
+            import json
+            config_path.write_text(
+                json.dumps(config, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info("Config saved to %s", config_path)
+        except OSError as e:
+            logger.warning("Cannot save config: %s", e)
+
+    def _quick_speed_check(self, mount_path: str) -> float:
+        """快速驗證（256KB），確認裝置速度沒有大幅變化"""
+        return self._benchmark_random_write(mount_path, test_size_mb=0.25)
+
     def activate(self, drive_letter: str, use_percent: float = 80.0,
                  on_progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
         """
         在指定磁碟上建立 swap/pagefile，立即擴展系統記憶體。
 
-        會先測速，根據隨機寫入效能限制 swap 大小，避免慢速裝置凍結系統。
+        持久記憶：首次測速後將結果存在 SD 卡上，下次插入讀取快取，
+        只做快速驗證（<1 秒），速度無明顯變化就跳過完整測速。
 
         Args:
             drive_letter: 磁碟代號 (e.g., "E")
@@ -89,22 +126,55 @@ class RealBoostEngine:
         self._original_mem = self.get_system_memory()
         self._device_letter = drive_letter
 
-        # 測速：用 4MB 隨機寫入測試裝置真實效能
-        report("測試裝置速度（約 3-5 秒）...")
         mount = f"{drive_letter}:\\" if self._is_windows else drive_letter
-        self._measured_rand_write_mbs = self._benchmark_random_write(mount)
-        report(f"測速完成：隨機寫入 {self._measured_rand_write_mbs:.0f} MB/s")
+
+        # 嘗試讀取上次的測速結果
+        cached = self._load_cached_config(mount)
+        need_full_benchmark = True
+
+        if cached:
+            cached_speed = cached.get("rand_write_mbs", 0)
+            report(f"讀取上次記錄：{cached_speed:.0f} MB/s，快速驗證中...")
+
+            # 快速驗證：256KB 測速 < 1 秒
+            quick_speed = self._quick_speed_check(mount)
+            drift = abs(quick_speed - cached_speed) / max(cached_speed, 1)
+
+            if drift <= self.SPEED_DRIFT_THRESHOLD:
+                # 速度穩定，使用快取
+                self._measured_rand_write_mbs = cached_speed
+                report(f"速度穩定（{quick_speed:.0f} ≈ {cached_speed:.0f} MB/s），使用上次設定")
+                need_full_benchmark = False
+            else:
+                report(f"速度變化較大（{quick_speed:.0f} vs {cached_speed:.0f} MB/s），重新完整測速...")
+
+        if need_full_benchmark:
+            # 完整測速：4MB 隨機寫入
+            report("測試裝置速度（約 3-5 秒）...")
+            self._measured_rand_write_mbs = self._benchmark_random_write(mount)
+            report(f"測速完成：隨機寫入 {self._measured_rand_write_mbs:.0f} MB/s")
 
         # 計算 swap 大小
         report("計算最佳 swap 大小...")
 
         if self._is_windows:
-            return self._activate_windows(drive_letter, use_percent, report)
+            result = self._activate_windows(drive_letter, use_percent, report)
         else:
-            return self._activate_linux(drive_letter, use_percent, report)
+            result = self._activate_linux(drive_letter, use_percent, report)
+
+        # 成功後存設定到 SD 卡，下次免重測
+        if result.get("success"):
+            self._save_config(mount, {
+                "rand_write_mbs": self._measured_rand_write_mbs,
+                "swap_size_bytes": self._swap_size_bytes,
+                "swap_filename": self.SWAP_FILENAME,
+                "drive_letter": drive_letter,
+            })
+
+        return result
 
     @staticmethod
-    def _benchmark_random_write(mount_path: str, test_size_mb: int = 4) -> float:
+    def _benchmark_random_write(mount_path: str, test_size_mb: float = 4) -> float:
         """
         用隨機 4KB 寫入測試裝置速度，模擬 swap/pagefile 的真實 I/O 模式。
         Returns: 隨機寫入速度 (MB/s)

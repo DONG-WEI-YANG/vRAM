@@ -8,4 +8,5 @@ build/
 *.tar.gz
 .pytest_cache/
 .vram_speed_test
+.vram_boost_config.json
 vram_boost.swap
