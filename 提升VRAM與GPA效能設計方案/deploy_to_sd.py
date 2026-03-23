@@ -111,14 +111,31 @@ def deploy(letter: str) -> bool:
             print(f"    請先執行 build 產生 exe")
             return False
 
-    # 複製檔案
+    # 複製檔案（用 binary write + fsync 確保完整寫入，避免 exFAT 損壞）
     for fname in DEPLOY_FILES:
         src = RELEASE_DIR / fname
         dst = dest / fname
         existing = dst.exists()
-        shutil.copy2(src, dst)
-        action = "更新" if existing else "部署"
-        size_mb = dst.stat().st_size / (1024 * 1024)
+
+        with open(src, "rb") as f_in:
+            data = f_in.read()
+        if existing:
+            dst.unlink()
+        with open(dst, "wb") as f_out:
+            f_out.write(data)
+            f_out.flush()
+            os.fsync(f_out.fileno())
+
+        # 驗證
+        with open(dst, "rb") as f_check:
+            header = f_check.read(4)
+        written_size = dst.stat().st_size
+        if written_size != len(data):
+            print(f"  [FAIL] {fname} size mismatch: {written_size} != {len(data)}")
+            return False
+
+        action = "update" if existing else "deploy"
+        size_mb = written_size / (1024 * 1024)
         print(f"  [OK] {action} {fname} ({size_mb:.1f} MB)")
 
     # Linux: 設定執行權限
