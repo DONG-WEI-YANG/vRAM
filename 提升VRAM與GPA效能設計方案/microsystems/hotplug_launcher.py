@@ -70,14 +70,36 @@ def get_my_drive() -> Optional[str]:
                 for v in data:
                     if v.get("DriveLetter"):
                         return v["DriveLetter"]
-        except Exception:
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            pass
+    else:
+        # Linux: 掃描可移除式掛載點
+        try:
+            r = subprocess.run(
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,SIZE,TYPE"],
+                capture_output=True, text=True, timeout=8,
+            )
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                for dev in data.get("blockdevices", []):
+                    if not dev.get("rm"):
+                        continue
+                    for part in dev.get("children", []):
+                        mp = part.get("mountpoint")
+                        if mp and mp not in ("/", "/boot", "/home"):
+                            return mp
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
             pass
 
     return None
 
 
 def detect_device_type(letter: str) -> Dict[str, Any]:
-    """偵測指定磁碟是什麼裝置"""
+    """
+    偵測指定磁碟是什麼裝置。
+    Windows: letter = "E" (磁碟代號)
+    Linux: letter = "/media/user/SDCARD" (掛載點)
+    """
     info = {
         "letter": letter,
         "label": "",
@@ -93,7 +115,7 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
     }
 
     if platform.system().lower() != "windows":
-        return info
+        return _detect_device_type_linux(info, letter)
 
     try:
         # Volume info
@@ -161,6 +183,70 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
 
     except Exception as e:
         logger.warning("Detection failed: %s", e)
+
+    return info
+
+
+def _detect_device_type_linux(info: Dict, mount_point: str) -> Dict:
+    """Linux: 用 lsblk + sysfs 偵測裝置類型"""
+    try:
+        usage = shutil.disk_usage(mount_point)
+        info["capacity_gb"] = usage.total / (1024 ** 3)
+        info["free_gb"] = usage.free / (1024 ** 3)
+    except OSError:
+        return info
+
+    try:
+        # 找到掛載點對應的區塊裝置
+        r = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,TRAN,ROTA,MODEL,FSTYPE,LABEL,TYPE"],
+            capture_output=True, text=True, timeout=8,
+        )
+        if r.returncode != 0:
+            return info
+
+        data = json.loads(r.stdout)
+        for dev in data.get("blockdevices", []):
+            children = dev.get("children", [])
+            # 也檢查裝置本身（無分區的情況）
+            all_parts = children + [dev]
+            for part in all_parts:
+                if part.get("mountpoint") != mount_point:
+                    continue
+
+                info["is_removable"] = bool(dev.get("rm"))
+                info["friendly_name"] = dev.get("model", "") or ""
+                info["label"] = part.get("label", "") or ""
+                info["fs"] = part.get("fstype", "") or ""
+                info["is_rotational"] = bool(dev.get("rota"))
+
+                tran = (dev.get("tran") or "").lower()
+                info["bus"] = tran
+                model_lower = info["friendly_name"].lower()
+
+                # 分類
+                if tran == "nvme":
+                    info["type"] = "nvme_enclosure" if info["is_removable"] else "sd_express"
+                elif tran in ("usb",):
+                    if info["is_rotational"]:
+                        info["type"] = "hdd"
+                    elif info["capacity_gb"] > 200 or "ssd" in model_lower:
+                        info["type"] = "usb_ssd"
+                    else:
+                        info["type"] = "usb_drive"
+                elif "mmc" in tran or "sd" in model_lower or "card" in model_lower:
+                    info["type"] = "sd_card"
+                elif info["is_rotational"]:
+                    info["type"] = "hdd"
+                elif info["is_removable"]:
+                    info["type"] = "sd_card"
+                else:
+                    info["type"] = "usb_drive"
+
+                return info
+
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        logger.warning("Linux detection failed: %s", e)
 
     return info
 
@@ -623,6 +709,22 @@ def _elevate_and_restart():
         pass
 
 
+def _elevate_linux():
+    """用 pkexec 或 sudo 提權重新啟動自己（Linux）"""
+    exe = sys.executable if not getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+    args = sys.argv[1:]
+
+    # 優先用 pkexec（圖形化密碼對話框）
+    for elevate_cmd in ["pkexec", "sudo"]:
+        if shutil.which(elevate_cmd):
+            try:
+                os.execvp(elevate_cmd, [elevate_cmd, exe] + args)
+            except OSError:
+                continue
+
+    logger.error("Cannot elevate: neither pkexec nor sudo found")
+
+
 # ── Entry Point ──
 
 def main():
@@ -645,10 +747,13 @@ def main():
         handlers=log_handlers,
     )
 
-    # Windows: 需要管理員權限才能建 pagefile，自動提權
-    if platform.system().lower() == "windows" and not _is_admin():
-        logger.info("Not admin, requesting elevation...")
-        _elevate_and_restart()
+    # 需要管理員/root 權限才能建 pagefile/swap，自動提權
+    if not _is_admin():
+        logger.info("Not admin/root, requesting elevation...")
+        if platform.system().lower() == "windows":
+            _elevate_and_restart()
+        else:
+            _elevate_linux()
         sys.exit(0)
 
     app = BoosterApp()

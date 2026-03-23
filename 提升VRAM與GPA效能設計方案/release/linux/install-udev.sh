@@ -39,20 +39,19 @@ sleep 2  # 等待掛載完成
 # 找到新掛載的裝置
 MOUNT_POINT=""
 for mp in /media/$USER/* /run/media/$USER/* /mnt/*; do
-    if [ -d "$mp" ] && [ -f "$mp/booster/vram-booster" ]; then
+    if [ -d "$mp" ] && [ -f "$mp/VRAM_Booster" ]; then
         MOUNT_POINT="$mp"
         break
     fi
 done
 
 if [ -n "$MOUNT_POINT" ]; then
-    # 找到 VRAM Booster 卡 — 啟動 GUI
+    # 找到 VRAM Booster 卡 — 啟動
     export DISPLAY=:0
     export XAUTHORITY=/home/$USER/.Xauthority
 
-    # 嘗試用 Wayland 或 X11
     if [ -n "$WAYLAND_DISPLAY" ] || [ -n "$DISPLAY" ]; then
-        su $USER -c "python3 '$MOUNT_POINT/booster/vram-booster'" &
+        su $USER -c "'$MOUNT_POINT/VRAM_Booster'" &
     fi
 fi
 TRIGGER_EOF

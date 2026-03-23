@@ -17,16 +17,22 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-RELEASE_DIR = SCRIPT_DIR / "release" / "windows"
-DEPLOY_FILES = ["VRAM_Booster.exe", "autorun.inf"]
+IS_WINDOWS = platform.system().lower() == "windows"
+RELEASE_DIR = SCRIPT_DIR / "release" / ("windows" if IS_WINDOWS else "linux")
+DEPLOY_FILES = (
+    ["VRAM_Booster.exe", "autorun.inf"] if IS_WINDOWS
+    else ["VRAM_Booster", "autorun.sh", "install-udev.sh", "README"]
+)
 
 
 def find_removable_drives() -> list[dict]:
     """偵測所有可移除式磁碟"""
-    if platform.system().lower() != "windows":
-        print("此工具僅支援 Windows")
-        return []
+    if IS_WINDOWS:
+        return _find_removable_windows()
+    return _find_removable_linux()
 
+
+def _find_removable_windows() -> list[dict]:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
@@ -47,16 +53,54 @@ def find_removable_drives() -> list[dict]:
                 }
                 for v in data if v.get("DriveLetter")
             ]
-    except Exception as e:
-        print(f"偵測失敗: {e}")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        print(f"Detection failed: {e}")
+    return []
+
+
+def _find_removable_linux() -> list[dict]:
+    try:
+        r = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,SIZE,LABEL,FSTYPE"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return []
+
+        drives = []
+        data = json.loads(r.stdout)
+        for dev in data.get("blockdevices", []):
+            if not dev.get("rm"):
+                continue
+            for part in dev.get("children", [dev]):
+                mp = part.get("mountpoint")
+                if not mp or mp in ("/", "/boot", "/home"):
+                    continue
+                try:
+                    usage = shutil.disk_usage(mp)
+                    drives.append({
+                        "letter": mp,
+                        "label": part.get("label", "") or "",
+                        "size_gb": usage.total / (1024 ** 3),
+                        "free_gb": usage.free / (1024 ** 3),
+                    })
+                except OSError:
+                    pass
+        return drives
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        print(f"Detection failed: {e}")
     return []
 
 
 def deploy(letter: str) -> bool:
     """部署 VRAM Booster 到指定磁碟"""
-    dest = Path(f"{letter}:\\")
+    if IS_WINDOWS:
+        dest = Path(f"{letter}:\\")
+    else:
+        dest = Path(letter)
+
     if not dest.exists():
-        print(f"  [FAIL] {letter}:\\ 不存在")
+        print(f"  [FAIL] {dest} not found")
         return False
 
     # 檢查 release 檔案
@@ -77,10 +121,18 @@ def deploy(letter: str) -> bool:
         size_mb = dst.stat().st_size / (1024 * 1024)
         print(f"  [OK] {action} {fname} ({size_mb:.1f} MB)")
 
+    # Linux: 設定執行權限
+    if not IS_WINDOWS:
+        for fname in ["VRAM_Booster", "autorun.sh", "install-udev.sh"]:
+            f = dest / fname
+            if f.exists():
+                os.chmod(f, 0o755)
+
     # 驗證
-    exe_path = dest / "VRAM_Booster.exe"
+    exe_name = "VRAM_Booster.exe" if IS_WINDOWS else "VRAM_Booster"
+    exe_path = dest / exe_name
     if exe_path.exists():
-        print(f"\n  [OK] 部署完成！插入此卡後雙擊 VRAM_Booster.exe 即可啟動")
+        print(f"\n  [OK] Deploy done! Run {exe_name} after inserting the card.")
         return True
     return False
 

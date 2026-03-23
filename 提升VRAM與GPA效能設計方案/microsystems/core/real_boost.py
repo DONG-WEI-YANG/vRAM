@@ -92,6 +92,23 @@ class RealBoostEngine:
                     label = r.stdout.strip()
             except (subprocess.TimeoutExpired, OSError):
                 pass
+        else:
+            # Linux: 用 lsblk 取得檔案系統 label
+            try:
+                r = subprocess.run(
+                    ["lsblk", "-J", "-o", "MOUNTPOINT,LABEL"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    import json
+                    data = json.loads(r.stdout)
+                    for dev in data.get("blockdevices", []):
+                        for part in dev.get("children", [dev]):
+                            if part.get("mountpoint") == mount_path:
+                                label = part.get("label", "") or ""
+                                break
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
         return f"{total_gb}GB|{label}"
 
