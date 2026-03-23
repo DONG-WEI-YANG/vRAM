@@ -56,14 +56,14 @@ def deploy(letter: str) -> bool:
     """部署 VRAM Booster 到指定磁碟"""
     dest = Path(f"{letter}:\\")
     if not dest.exists():
-        print(f"  ✗ {letter}:\\ 不存在")
+        print(f"  [FAIL] {letter}:\\ 不存在")
         return False
 
     # 檢查 release 檔案
     for fname in DEPLOY_FILES:
         src = RELEASE_DIR / fname
         if not src.exists():
-            print(f"  ✗ 找不到 {src}")
+            print(f"  [FAIL] 找不到 {src}")
             print(f"    請先執行 build 產生 exe")
             return False
 
@@ -75,12 +75,12 @@ def deploy(letter: str) -> bool:
         shutil.copy2(src, dst)
         action = "更新" if existing else "部署"
         size_mb = dst.stat().st_size / (1024 * 1024)
-        print(f"  ✓ {action} {fname} ({size_mb:.1f} MB)")
+        print(f"  [OK] {action} {fname} ({size_mb:.1f} MB)")
 
     # 驗證
     exe_path = dest / "VRAM_Booster.exe"
     if exe_path.exists():
-        print(f"\n  ✓ 部署完成！插入此卡後雙擊 VRAM_Booster.exe 即可啟動")
+        print(f"\n  [OK] 部署完成！插入此卡後雙擊 VRAM_Booster.exe 即可啟動")
         return True
     return False
 
