@@ -476,24 +476,13 @@ class RealBoostEngine:
             report(f"建立 pagefile ({swap_mb // 1024}GB)...")
 
         try:
-            # 用 wmic 註冊 pagefile（已存在的檔案也需要重新註冊）
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_path_str.replace(chr(92), chr(92)+chr(92))}'\" -ErrorAction SilentlyContinue; "
-                 f"if (-not $pf) {{ "
-                 f"  $pf = ([WmiClass]'Win32_PageFileSetting').CreateInstance(); "
-                 f"  $pf.Name = '{swap_path_str}'; "
-                 f"  $pf.InitialSize = {swap_mb}; "
-                 f"  $pf.MaximumSize = {swap_mb}; "
-                 f"  $pf.Put() "
-                 f"}}"],
-                capture_output=True, text=True, timeout=30,
-            )
+            # 嘗試多種方法建立 pagefile（按可靠度排序）
+            ok, err_detail = self._register_pagefile_windows(swap_path_str, swap_mb)
 
-            if r.returncode != 0:
+            if not ok:
                 return {
                     "success": False,
-                    "error": "需要管理員權限才能建立 pagefile。請以系統管理員身份執行。",
+                    "error": err_detail,
                     "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
                 }
 
@@ -524,9 +513,76 @@ class RealBoostEngine:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # 已移除 _activate_windows_fallback：
-    # 舊的 fallback 建立稀疏檔案但從未 mmap()，報告成功卻實際增加 0 bytes 記憶體。
-    # pagefile 建立需要管理員權限，沒有安全的非特權替代方案。
+    @staticmethod
+    def _register_pagefile_windows(swap_path: str, size_mb: int) -> Tuple[bool, str]:
+        """
+        嘗試多種方式在 Windows 建立 pagefile，回傳 (success, error_detail)。
+        即使以管理員執行，WMI 也可能因各種原因失敗，所以有 fallback。
+        """
+        escaped_path = swap_path.replace("\\", "\\\\")
+
+        # 方法 1: WMI Win32_PageFileSetting
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{escaped_path}'\" -ErrorAction SilentlyContinue; "
+                 f"if (-not $pf) {{ "
+                 f"  $pf = ([WmiClass]'Win32_PageFileSetting').CreateInstance(); "
+                 f"  $pf.Name = '{swap_path}'; "
+                 f"  $pf.InitialSize = {size_mb}; "
+                 f"  $pf.MaximumSize = {size_mb}; "
+                 f"  $pf.Put() "
+                 f"}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                logger.info("Pagefile registered via WMI")
+                return True, ""
+            wmi_err = (r.stderr or r.stdout).strip()
+            logger.warning("WMI method failed: %s", wmi_err)
+        except subprocess.TimeoutExpired:
+            wmi_err = "WMI timeout"
+
+        # 方法 2: wmic pagefile (舊版 Windows 相容)
+        try:
+            r = subprocess.run(
+                ["wmic", "pagefileset", "create",
+                 f"name=\"{swap_path}\"",
+                 f"InitialSize={size_mb}",
+                 f"MaximumSize={size_mb}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                logger.info("Pagefile registered via wmic")
+                return True, ""
+            wmic_err = (r.stderr or r.stdout).strip()
+            logger.warning("wmic method failed: %s", wmic_err)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            wmic_err = "wmic not available"
+
+        # 方法 3: PowerShell Set-CimInstance (Windows 10+)
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$sys = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; "
+                 f"if ($sys.AutomaticManagedPagefile) {{ "
+                 f"  $sys | Set-CimInstance -Property @{{AutomaticManagedPagefile=$false}} "
+                 f"}}; "
+                 f"New-CimInstance -ClassName Win32_PageFileSetting "
+                 f"-Property @{{Name='{swap_path}'; InitialSize={size_mb}; MaximumSize={size_mb}}} "
+                 f"-ErrorAction Stop"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                logger.info("Pagefile registered via CIM")
+                return True, ""
+            cim_err = (r.stderr or r.stdout).strip()
+            logger.warning("CIM method failed: %s", cim_err)
+        except subprocess.TimeoutExpired:
+            cim_err = "CIM timeout"
+
+        # 全部失敗 — 回報真實錯誤
+        return False, f"Pagefile 建立失敗（已以管理員執行）: {wmi_err}"
 
     def _deactivate_windows(self) -> Dict[str, Any]:
         """取消 Windows pagefile 註冊，但保留檔案供下次快速啟動"""

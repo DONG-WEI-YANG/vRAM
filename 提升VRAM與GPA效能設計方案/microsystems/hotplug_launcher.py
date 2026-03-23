@@ -410,6 +410,15 @@ class BoosterApp:
             tk.Label(r, text=val, font=("Segoe UI", 9, "bold"),
                      fg=fg, bg=self.BG2, anchor="w").pack(side="left", padx=(8, 0))
 
+        # 警告：卡上有其他檔案
+        used_gb = info["capacity_gb"] - info["free_gb"]
+        if used_gb > 1.0:
+            warn_f = tk.Frame(self._frame, bg="#3e2723", padx=10, pady=4)
+            warn_f.pack(fill="x", padx=15, pady=(4, 0))
+            tk.Label(warn_f,
+                     text=f"* {used_gb:.0f}GB used, swap only uses free space",
+                     font=("Segoe UI", 8), fg=self.ORANGE, bg="#3e2723").pack()
+
         # 按鈕
         btn = tk.Frame(self._frame, bg=self.BG)
         btn.pack(pady=12)
