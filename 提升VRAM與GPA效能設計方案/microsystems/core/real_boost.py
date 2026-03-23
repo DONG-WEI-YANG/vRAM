@@ -465,22 +465,29 @@ class RealBoostEngine:
         swap_path_str = f"{letter}:\\{self.SWAP_FILENAME}"
         swap_path = Path(swap_path_str)
 
-        # 檢查上次的 swap 檔案是否還在且完整
+        # 先算出速度公式的上限
+        wanted_bytes = int(usage.free * (use_pct / 100))
+        wanted_bytes, speed_warning_msg = self._cap_swap_by_speed(wanted_bytes)
+
+        # 檢查上次的 swap 檔案是否可複用
         reuse = False
         if swap_path.exists() and self._verify_swap_file(swap_path):
             existing_size = swap_path.stat().st_size
-            swap_bytes = existing_size
-            reuse = True
-            report(f"swap ({existing_size // (1024**3)}GB) verify OK")
+            # 舊檔案大小在合理範圍內才複用（不超過上限的 1.5 倍）
+            if existing_size <= wanted_bytes * 1.5:
+                swap_bytes = existing_size
+                reuse = True
+                report(f"swap ({existing_size // (1024**3)}GB) reuse OK")
+            else:
+                # 舊 swap 太大（可能是修復前建的），刪掉重建
+                report(f"swap too large ({existing_size // (1024**3)}GB > {wanted_bytes // (1024**3)}GB limit), rebuilding...")
+                try:
+                    swap_path.unlink()
+                except OSError:
+                    pass
 
         if not reuse:
-            # 計算 swap 大小 (可用空間的 use_pct%)
-            swap_bytes = int(usage.free * (use_pct / 100))
-
-            # 根據裝置速度限制 swap 大小
-            swap_bytes, speed_warning_msg = self._cap_swap_by_speed(swap_bytes)
-        else:
-            speed_warning_msg = ""
+            swap_bytes = wanted_bytes
 
         swap_mb = swap_bytes // (1024 * 1024)
 
@@ -488,7 +495,7 @@ class RealBoostEngine:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
 
         if not reuse:
-            report(f"建立 pagefile ({swap_mb // 1024}GB)...")
+            report(f"building pagefile ({swap_mb // 1024}GB)...")
 
         try:
             # 嘗試多種方法建立 pagefile（按可靠度排序）
@@ -633,19 +640,27 @@ class RealBoostEngine:
 
         swap_path = Path(mount_point) / self.SWAP_FILENAME
 
-        # 檢查上次的 swap 檔案是否還在且完整
+        # 先算出速度公式的上限
+        wanted_bytes = int(usage.free * (use_pct / 100))
+        wanted_bytes, speed_warning_msg = self._cap_swap_by_speed(wanted_bytes)
+
+        # 檢查上次的 swap 檔案是否可複用
         reuse = False
         if swap_path.exists() and self._verify_swap_file(swap_path):
             existing_size = swap_path.stat().st_size
-            swap_bytes = existing_size
-            reuse = True
-            report(f"swap ({existing_size // (1024**3)}GB) verify OK")
+            if existing_size <= wanted_bytes * 1.5:
+                swap_bytes = existing_size
+                reuse = True
+                report(f"swap ({existing_size // (1024**3)}GB) reuse OK")
+            else:
+                report(f"swap too large ({existing_size // (1024**3)}GB > {wanted_bytes // (1024**3)}GB limit), rebuilding...")
+                try:
+                    swap_path.unlink()
+                except OSError:
+                    pass
 
         if not reuse:
-            swap_bytes = int(usage.free * (use_pct / 100))
-            swap_bytes, speed_warning_msg = self._cap_swap_by_speed(swap_bytes)
-        else:
-            speed_warning_msg = ""
+            swap_bytes = wanted_bytes
 
         swap_mb = swap_bytes // (1024 * 1024)
 
@@ -654,7 +669,7 @@ class RealBoostEngine:
 
         try:
             if not reuse:
-                report(f"建立 swap 檔案 ({swap_mb // 1024}GB)，請稍候...")
+                report(f"building swap ({swap_mb // 1024}GB)...")
                 _run_hidden(
                     ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
                     timeout=300, check=True,
