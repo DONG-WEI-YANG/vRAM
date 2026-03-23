@@ -226,6 +226,9 @@ class BoosterApp:
         self._phase = "detecting"  # detecting → confirm → active
 
     def run(self):
+        # 降低自身程序優先權，避免監控佔用前景資源
+        self._lower_process_priority()
+
         self._root = tk.Tk()
         self._root.title("VRAM Booster")
         self._root.configure(bg=self.BG)
@@ -438,7 +441,7 @@ class BoosterApp:
             except Exception:
                 pass
 
-        self._root.after(2000, self._poll_monitor)
+        self._root.after(10000, self._poll_monitor)  # 10 秒輪詢，減少資源佔用
 
     # ── Actions ──
 
@@ -505,6 +508,22 @@ class BoosterApp:
             self._root.destroy()
 
     # ── Helpers ──
+
+    @staticmethod
+    def _lower_process_priority():
+        """降低自身程序優先權，讓前景應用不受影響"""
+        try:
+            if platform.system().lower() == "windows":
+                import ctypes
+                # BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+                ctypes.windll.kernel32.SetPriorityClass(
+                    ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+                logger.info("Process priority set to BELOW_NORMAL")
+            else:
+                os.nice(10)  # Linux: 降低 10 級優先權
+                logger.info("Process niceness increased by 10")
+        except Exception as e:
+            logger.debug("Cannot lower priority: %s", e)
 
     def _clear(self):
         for w in self._frame.winfo_children():

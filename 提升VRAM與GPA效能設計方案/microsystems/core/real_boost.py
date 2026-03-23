@@ -67,22 +67,60 @@ class RealBoostEngine:
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
 
+    @staticmethod
+    def _get_card_fingerprint(mount_path: str) -> str:
+        """
+        產生 SD 卡指紋：容量 + 磁碟標籤。
+        不同的卡會有不同指紋，即使插在同一個讀卡機。
+        """
+        try:
+            usage = shutil.disk_usage(mount_path)
+            total_gb = round(usage.total / (1024 ** 3), 1)
+        except OSError:
+            total_gb = 0
+
+        label = ""
+        if platform.system().lower() == "windows":
+            letter = mount_path.rstrip(":\\/ ")[0]
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-Volume -DriveLetter {letter} -ErrorAction Stop).FileSystemLabel"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    label = r.stdout.strip()
+            except Exception:
+                pass
+
+        return f"{total_gb}GB|{label}"
+
     def _load_cached_config(self, mount_path: str) -> Optional[Dict[str, Any]]:
-        """讀取 SD 卡上的快取設定"""
+        """讀取 SD 卡上的快取設定，並驗證指紋是否匹配"""
         config_path = Path(mount_path) / self.CONFIG_FILENAME
         if not config_path.exists():
             return None
         try:
             import json
             data = json.loads(config_path.read_text(encoding="utf-8"))
-            if "rand_write_mbs" in data and "swap_size_bytes" in data:
-                return data
+            if "rand_write_mbs" not in data or "swap_size_bytes" not in data:
+                return None
+
+            # 指紋比對：設定檔可能是另一張卡留下的
+            saved_fp = data.get("card_fingerprint", "")
+            current_fp = self._get_card_fingerprint(mount_path)
+            if saved_fp and saved_fp != current_fp:
+                logger.info("Card fingerprint mismatch: saved=%s current=%s", saved_fp, current_fp)
+                return None  # 不同的卡，不用快取
+
+            return data
         except (json.JSONDecodeError, OSError):
             pass
         return None
 
     def _save_config(self, mount_path: str, config: Dict[str, Any]) -> None:
-        """將設定存到 SD 卡，下次插入可直接使用"""
+        """將設定存到 SD 卡（含卡片指紋），下次插入可直接使用"""
+        config["card_fingerprint"] = self._get_card_fingerprint(mount_path)
         config_path = Path(mount_path) / self.CONFIG_FILENAME
         try:
             import json
@@ -266,27 +304,40 @@ class RealBoostEngine:
 
     @staticmethod
     def get_system_memory() -> Dict[str, int]:
-        """取得系統記憶體真實數據"""
+        """
+        取得系統記憶體真實數據。
+        Windows 用 ctypes (GlobalMemoryStatusEx) — 零成本，不啟動子程序。
+        Linux 用 /proc/meminfo — 同樣輕量。
+        """
         mem = {"physical_total": 0, "physical_available": 0, "swap_total": 0, "swap_used": 0}
 
         if platform.system().lower() == "windows":
             try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "Get-CimInstance Win32_OperatingSystem | "
-                     "Select-Object TotalVisibleMemorySize,FreePhysicalMemory,"
-                     "TotalVirtualMemorySize,FreeVirtualMemory | ConvertTo-Json"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    import json
-                    d = json.loads(r.stdout)
-                    mem["physical_total"] = d.get("TotalVisibleMemorySize", 0) * 1024
-                    mem["physical_available"] = d.get("FreePhysicalMemory", 0) * 1024
-                    total_virtual = d.get("TotalVirtualMemorySize", 0) * 1024
-                    mem["swap_total"] = total_virtual - mem["physical_total"]
-                    free_virtual = d.get("FreeVirtualMemory", 0) * 1024
-                    mem["swap_used"] = mem["swap_total"] - (free_virtual - mem["physical_available"])
+                import ctypes
+                import ctypes.wintypes
+
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.wintypes.DWORD),
+                        ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+
+                mem["physical_total"] = stat.ullTotalPhys
+                mem["physical_available"] = stat.ullAvailPhys
+                mem["swap_total"] = stat.ullTotalPageFile - stat.ullTotalPhys
+                swap_free = stat.ullAvailPageFile - stat.ullAvailPhys
+                mem["swap_used"] = max(0, mem["swap_total"] - swap_free)
             except Exception:
                 pass
         else:
@@ -308,9 +359,18 @@ class RealBoostEngine:
 
         return mem
 
-    @staticmethod
-    def get_gpu_info() -> Dict[str, Any]:
-        """取得 GPU 真實資訊"""
+    # GPU 資訊快取：nvidia-smi 呼叫較重，快取 30 秒
+    _gpu_cache: Optional[Dict[str, Any]] = None
+    _gpu_cache_ts: float = 0.0
+    _GPU_CACHE_TTL: float = 30.0
+
+    @classmethod
+    def get_gpu_info(cls) -> Dict[str, Any]:
+        """取得 GPU 資訊（快取 30 秒，避免頻繁呼叫 nvidia-smi）"""
+        now = time.time()
+        if cls._gpu_cache and (now - cls._gpu_cache_ts) < cls._GPU_CACHE_TTL:
+            return cls._gpu_cache
+
         info = {"name": "Unknown", "vram_total_mb": 0, "vram_used_mb": 0, "vram_free_mb": 0}
         try:
             r = subprocess.run(
@@ -327,6 +387,9 @@ class RealBoostEngine:
                     info["vram_free_mb"] = int(parts[3].strip())
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+
+        cls._gpu_cache = info
+        cls._gpu_cache_ts = now
         return info
 
     # ── Windows: Pagefile ──
