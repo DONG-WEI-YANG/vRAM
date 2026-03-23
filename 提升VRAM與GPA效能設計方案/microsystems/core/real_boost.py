@@ -341,28 +341,43 @@ class RealBoostEngine:
         except OSError as e:
             return {"success": False, "error": f"Cannot access {mount}: {e}"}
 
-        # 計算 swap 大小 (可用空間的 use_pct%)
-        swap_bytes = int(usage.free * (use_pct / 100))
+        swap_path_str = f"{letter}:\\{self.SWAP_FILENAME}"
+        swap_path = Path(swap_path_str)
 
-        # 根據裝置速度限制 swap 大小
-        swap_bytes, speed_warning = self._cap_swap_by_speed(swap_bytes)
+        # 檢查上次的 swap 檔案是否還在
+        reuse = False
+        if swap_path.exists():
+            existing_size = swap_path.stat().st_size
+            if existing_size >= 512 * (1024 ** 2):
+                swap_bytes = existing_size
+                reuse = True
+                report(f"偵測到上次的 swap 檔案（{existing_size // (1024**3)}GB），直接註冊...")
+
+        if not reuse:
+            # 計算 swap 大小 (可用空間的 use_pct%)
+            swap_bytes = int(usage.free * (use_pct / 100))
+
+            # 根據裝置速度限制 swap 大小
+            swap_bytes, speed_warning_msg = self._cap_swap_by_speed(swap_bytes)
+        else:
+            speed_warning_msg = ""
 
         swap_mb = swap_bytes // (1024 * 1024)
 
         if swap_mb < 512:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
 
-        swap_path = f"{letter}:\\{self.SWAP_FILENAME}"
-        report(f"建立 pagefile ({swap_mb // 1024}GB)...")
+        if not reuse:
+            report(f"建立 pagefile ({swap_mb // 1024}GB)...")
 
         try:
-            # 用 wmic 建立 pagefile (需要管理員權限)
+            # 用 wmic 註冊 pagefile（已存在的檔案也需要重新註冊）
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
-                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_path.replace(chr(92), chr(92)+chr(92))}'\" -ErrorAction SilentlyContinue; "
+                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_path_str.replace(chr(92), chr(92)+chr(92))}'\" -ErrorAction SilentlyContinue; "
                  f"if (-not $pf) {{ "
                  f"  $pf = ([WmiClass]'Win32_PageFileSetting').CreateInstance(); "
-                 f"  $pf.Name = '{swap_path}'; "
+                 f"  $pf.Name = '{swap_path_str}'; "
                  f"  $pf.InitialSize = {swap_mb}; "
                  f"  $pf.MaximumSize = {swap_mb}; "
                  f"  $pf.Put() "
@@ -377,25 +392,28 @@ class RealBoostEngine:
                     "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
                 }
 
-            self._swap_path = Path(swap_path)
+            self._swap_path = swap_path
             self._swap_size_bytes = swap_bytes
             self._active = True
 
             after_mem = self.get_system_memory()
             added_gb = swap_bytes / (1024 ** 3)
 
-            logger.info("Windows pagefile created: %s (%.1fGB)", swap_path, added_gb)
+            method = "pagefile_reuse" if reuse else "pagefile"
+            logger.info("Windows pagefile %s: %s (%.1fGB)",
+                        "reused" if reuse else "created", swap_path_str, added_gb)
 
             result = {
                 "success": True,
-                "method": "pagefile",
-                "swap_path": swap_path,
+                "method": method,
+                "reused": reuse,
+                "swap_path": swap_path_str,
                 "added_gb": round(added_gb, 1),
                 "total_usable_gb": round(after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
                 "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             }
-            if speed_warning:
-                result["warning"] = speed_warning
+            if speed_warning_msg:
+                result["warning"] = speed_warning_msg
             return result
 
         except Exception as e:
@@ -406,10 +424,10 @@ class RealBoostEngine:
     # pagefile 建立需要管理員權限，沒有安全的非特權替代方案。
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """移除 Windows pagefile/swap"""
+        """取消 Windows pagefile 註冊，但保留檔案供下次快速啟動"""
         if self._swap_path:
             try:
-                # 嘗試移除 WMI pagefile
+                # 取消 WMI pagefile 註冊
                 swap_str = str(self._swap_path).replace("\\", "\\\\")
                 subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
@@ -420,11 +438,8 @@ class RealBoostEngine:
             except Exception:
                 pass
 
-            # 刪除檔案
-            try:
-                self._swap_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
+            logger.info("Pagefile unregistered, file kept for reuse: %s", self._swap_path)
 
         self._active = False
         self._swap_path = None
@@ -443,27 +458,40 @@ class RealBoostEngine:
         except OSError as e:
             return {"success": False, "error": str(e)}
 
-        swap_bytes = int(usage.free * (use_pct / 100))
+        swap_path = Path(mount_point) / self.SWAP_FILENAME
 
-        # 根據裝置速度限制 swap 大小
-        swap_bytes, speed_warning = self._cap_swap_by_speed(swap_bytes)
+        # 檢查上次的 swap 檔案是否還在
+        reuse = False
+        if swap_path.exists():
+            existing_size = swap_path.stat().st_size
+            if existing_size >= 512 * (1024 ** 2):
+                swap_bytes = existing_size
+                reuse = True
+                report(f"偵測到上次的 swap 檔案（{existing_size // (1024**3)}GB），直接啟用...")
+
+        if not reuse:
+            swap_bytes = int(usage.free * (use_pct / 100))
+            swap_bytes, speed_warning_msg = self._cap_swap_by_speed(swap_bytes)
+        else:
+            speed_warning_msg = ""
 
         swap_mb = swap_bytes // (1024 * 1024)
-        swap_path = Path(mount_point) / self.SWAP_FILENAME
 
         if swap_mb < 512:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB"}
 
         try:
-            report(f"建立 swap 檔案 ({swap_mb // 1024}GB)，請稍候...")
-            subprocess.run(
-                ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
-                capture_output=True, timeout=300, check=True,
-            )
-            report("設定 swap 權限...")
-            subprocess.run(["chmod", "600", str(swap_path)], check=True)
-            report("格式化 swap...")
-            subprocess.run(["mkswap", str(swap_path)], capture_output=True, check=True)
+            if not reuse:
+                report(f"建立 swap 檔案 ({swap_mb // 1024}GB)，請稍候...")
+                subprocess.run(
+                    ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
+                    capture_output=True, timeout=300, check=True,
+                )
+                report("設定 swap 權限...")
+                subprocess.run(["chmod", "600", str(swap_path)], check=True)
+                report("格式化 swap...")
+                subprocess.run(["mkswap", str(swap_path)], capture_output=True, check=True)
+
             report("啟用 swap...")
             subprocess.run(["swapon", str(swap_path)], capture_output=True, check=True)
 
@@ -472,27 +500,32 @@ class RealBoostEngine:
             self._active = True
 
             added_gb = swap_bytes / (1024 ** 3)
-            logger.info("Linux swap activated: %s (%.1fGB)", swap_path, added_gb)
+            method = "swap_reuse" if reuse else "swap_file"
+            logger.info("Linux swap %s: %s (%.1fGB)",
+                        "reused" if reuse else "created", swap_path, added_gb)
 
             result = {
                 "success": True,
-                "method": "swap_file",
+                "method": method,
+                "reused": reuse,
                 "swap_path": str(swap_path),
                 "added_gb": round(added_gb, 1),
                 "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             }
-            if speed_warning:
-                result["warning"] = speed_warning
+            if speed_warning_msg:
+                result["warning"] = speed_warning_msg
             return result
 
         except subprocess.CalledProcessError as e:
             return {"success": False, "error": str(e)}
 
     def _deactivate_linux(self) -> Dict[str, Any]:
+        """取消 swap，但保留檔案供下次快速啟動"""
         if self._swap_path:
             try:
                 subprocess.run(["swapoff", str(self._swap_path)], capture_output=True, timeout=30)
-                self._swap_path.unlink(missing_ok=True)
+                # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
+                logger.info("Swap disabled, file kept for reuse: %s", self._swap_path)
             except Exception:
                 pass
 

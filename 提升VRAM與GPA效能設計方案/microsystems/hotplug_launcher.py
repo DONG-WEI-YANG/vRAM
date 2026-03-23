@@ -466,9 +466,10 @@ class BoosterApp:
 
                 if result.get("success"):
                     added = result.get("added_gb", 0)
-                    method = result.get("method", "")
+                    reused = result.get("reused", False)
                     rand_mbs = result.get("rand_write_mbs", 0)
-                    self._system_name = f"+{added:.0f} GB ({method})"
+                    label = "快速啟動" if reused else "已建立"
+                    self._system_name = f"+{added:.0f} GB ({label})"
                     self._system = True  # 標記為已啟動
 
                     if hasattr(self, '_info_lbls'):
