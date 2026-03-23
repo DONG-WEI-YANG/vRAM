@@ -1,0 +1,10 @@
+VRAM Booster for Linux
+======================
+
+插入此儲存裝置後：
+
+  方法 1 (手動): 開啟檔案管理器 → 雙擊 vram-booster
+  方法 2 (自動): 執行一次 sudo ./install-udev.sh
+                 之後每次插入都會自動啟動
+
+移除自動觸發：sudo ./install-udev.sh --remove

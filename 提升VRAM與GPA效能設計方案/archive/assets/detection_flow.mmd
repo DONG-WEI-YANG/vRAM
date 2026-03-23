@@ -1,0 +1,33 @@
+flowchart TD
+    A["使用者插入 SD 卡"] --> B["硬體控制器喚醒<br/>(低速 SD 模式 3.3V)"]
+    B --> C["讀取 CID / CSD / SCR 暫存器"]
+    C --> D{"SCR 暫存器回報<br/>支援 PCIe/NVMe？"}
+    
+    D -->|"否：傳統 SD 卡<br/>(UHS-I/II/III)"| E["拒絕作為 VRAM<br/>顯示警告訊息"]
+    E --> F["僅作為普通<br/>外接儲存裝置"]
+    
+    D -->|"是：SD Express 卡"| G["發送 CMD 切換<br/>PCIe 模式"]
+    G --> H["SD 卡以 NVMe 裝置<br/>重新連接系統匯流排"]
+    H --> I["驅動程式讀取<br/>PCIe 通道數與世代"]
+    I --> J["執行頻寬測試<br/>(5 秒快速基準測試)"]
+    J --> K{"頻寬 > 1,500 MB/s？"}
+    
+    K -->|"否"| L["低效能警告<br/>建議升級 SD 卡"]
+    L --> M["仍可加入 VRAM 池<br/>但標記為低優先級"]
+    
+    K -->|"是"| N["加入高效能<br/>VRAM 擴展資源池"]
+    
+    M --> O["驅動程式啟動<br/>CUDA 攔截層"]
+    N --> O
+    O --> P["AI 應用程式啟動<br/>看到擴展後的 VRAM"]
+
+    style A fill:#4CAF50,stroke:#333,color:#fff
+    style D fill:#FF9800,stroke:#333,color:#fff
+    style E fill:#F44336,stroke:#333,color:#fff
+    style F fill:#F44336,stroke:#333,color:#fff
+    style K fill:#FF9800,stroke:#333,color:#fff
+    style L fill:#FFC107,stroke:#333,color:#000
+    style M fill:#FFC107,stroke:#333,color:#000
+    style N fill:#2196F3,stroke:#333,color:#fff
+    style O fill:#9C27B0,stroke:#333,color:#fff
+    style P fill:#4CAF50,stroke:#333,color:#fff

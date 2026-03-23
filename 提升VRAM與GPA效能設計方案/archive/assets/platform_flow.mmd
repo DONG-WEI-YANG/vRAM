@@ -1,0 +1,32 @@
+flowchart LR
+    subgraph HW["硬體層"]
+        SD["SD Express 卡<br/>(NVMe 模式)"]
+    end
+
+    subgraph LINUX["Linux 驅動堆疊"]
+        direction TB
+        L1["核心模組<br/>greenboost.ko"] --> L2["DMA-BUF 匯出<br/>記憶體區塊"]
+        L2 --> L3["LD_PRELOAD 注入<br/>libsdvram_cuda.so"]
+        L3 --> L4["攔截 cudaMalloc<br/>重定向至 SD 卡"]
+    end
+
+    subgraph WINDOWS["Windows 驅動堆疊"]
+        direction TB
+        W1["Windows NVMe 驅動<br/>stornvme.sys"] --> W2["SD-VRAM 背景服務<br/>(System Tray)"]
+        W2 --> W3["CUDA VMM API<br/>cuMemCreate / cuMemMap"]
+        W3 --> W4["DirectStorage API<br/>NVMe → GPU DMA"]
+    end
+
+    subgraph APP["AI 應用程式"]
+        A1["PyTorch / Ollama<br/>看到 40GB VRAM"]
+    end
+
+    SD --> L1
+    SD --> W1
+    L4 --> A1
+    W4 --> A1
+
+    style SD fill:#FFD700,stroke:#333,color:#000
+    style LINUX fill:#FFF3E0,stroke:#E65100
+    style WINDOWS fill:#E3F2FD,stroke:#1565C0
+    style APP fill:#E8F5E9,stroke:#2E7D32

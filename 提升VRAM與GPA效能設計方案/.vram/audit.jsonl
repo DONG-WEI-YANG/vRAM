@@ -1,0 +1,5 @@
+{"ts":"2026-03-23T04:51:37.398+00:00","op":"activate","system":"SD-VRAM Booster (Legacy)","device":"usb3_flash","total_gb":523.5,"duration_s":0}
+{"ts":"2026-03-23T04:51:47.397+00:00","op":"deactivate","system":"SD-VRAM Booster (Legacy)","device":"","total_gb":0,"duration_s":10.0}
+{"ts":"2026-03-23T04:56:51.017+00:00","op":"activate","system":"SD-VRAM Booster (Legacy)","device":"usb3_flash","total_gb":523.5,"duration_s":0}
+{"ts":"2026-03-23T05:10:38.241+00:00","op":"activate","system":"SD-VRAM Booster (Legacy)","device":"usb3_flash","total_gb":523.5,"duration_s":0}
+{"ts":"2026-03-23T05:14:58.257+00:00","op":"deactivate","system":"SD-VRAM Booster (Legacy)","device":"","total_gb":0,"duration_s":260.0}

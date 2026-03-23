@@ -1,0 +1,367 @@
+{
+  "scenario_1_rtx4070_512gb": {
+    "bandwidth": {
+      "vram_gbs": 504,
+      "ram_gbs": 51.2,
+      "sd_gbs": 1.92,
+      "sd_vs_vram_ratio": "1:262",
+      "sd_vs_ram_ratio": "1:26"
+    },
+    "llm_inference": {
+      "Llama-3 8B (Q4)": {
+        "weight_gb": 4.5,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 125.0,
+        "boosted_tps": 125.0,
+        "kv_offload_tps": 99.7,
+        "vram_context_tokens": 53248,
+        "boosted_context_tokens": 3680665,
+        "context_boost_ratio": 69.1,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Qwen-2.5 32B (Q4)": {
+        "weight_gb": 18.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.3,
+        "kv_offload_tps": 0.3,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 1813708,
+        "context_boost_ratio": 1813708.0,
+        "status": "✓ 需要 SD 擴展 (溢出 6.0GB)"
+      },
+      "Llama-3 70B (Q4)": {
+        "weight_gb": 40.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.1,
+        "kv_offload_tps": 0.1,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 1450967,
+        "context_boost_ratio": 1450967.0,
+        "status": "✓ 需要 SD 擴展 (溢出 28.0GB)"
+      },
+      "Mixtral 8x22B (Q4)": {
+        "weight_gb": 80.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.0,
+        "kv_offload_tps": 0.0,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 906854,
+        "context_boost_ratio": 906854.0,
+        "status": "✓ 需要 SD 擴展 (溢出 68.0GB)"
+      }
+    },
+    "use_cases": {
+      "ai_inference": {
+        "description": "AI 模型推理（LLM、Stable Diffusion）",
+        "benefit": "讓 VRAM 不足的模型可以運行",
+        "typical_boost": "從「無法運行」→「可以運行 (1-15 tok/s)」"
+      },
+      "context_window": {
+        "description": "長文本對話 Context Window 擴展",
+        "benefit": "Context 從 ~50K → ~3627K tokens",
+        "typical_boost": "最高 64x 提升"
+      },
+      "kv_cache_persistence": {
+        "description": "KV Cache 持久化（對話記憶不丟失）",
+        "benefit": "關機後 KV Cache 保留在 SD 卡，下次秒恢復",
+        "typical_boost": "TTFT 加速最高 14x（免重算 Prefill）"
+      },
+      "model_hot_swap": {
+        "description": "AI 模型卡匣（不同 SD 卡存不同模型）",
+        "benefit": "隨插即用切換模型，免下載",
+        "typical_boost": "模型切換時間從 ~5min → ~10sec"
+      }
+    },
+    "summary": {
+      "gpu": "NVIDIA GeForce RTX 4070",
+      "gpu_vram_gb": 12.0,
+      "sd_card": "Samsung SD Express Pro 512GB",
+      "sd_capacity_gb": 512,
+      "sd_mode": "SD Express Gen3 x2 (最高 1,969 MB/s)",
+      "sd_bandwidth_mbs": 1969,
+      "total_effective_memory_gb": 454.8,
+      "memory_expansion_ratio": "37.9x"
+    }
+  },
+  "scenario_2_rtx4060_256gb": {
+    "bandwidth": {
+      "vram_gbs": 272,
+      "ram_gbs": 51.2,
+      "sd_gbs": 0.96,
+      "sd_vs_vram_ratio": "1:282",
+      "sd_vs_ram_ratio": "1:53"
+    },
+    "llm_inference": {
+      "Llama-3 8B (Q4)": {
+        "weight_gb": 4.5,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 125.0,
+        "boosted_tps": 125.0,
+        "kv_offload_tps": 82.9,
+        "vram_context_tokens": 20480,
+        "boosted_context_tokens": 1819443,
+        "context_boost_ratio": 88.8,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Qwen-2.5 32B (Q4)": {
+        "weight_gb": 18.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.1,
+        "kv_offload_tps": 0.1,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 899481,
+        "context_boost_ratio": 899481.0,
+        "status": "✓ 需要 SD 擴展 (溢出 10.0GB)"
+      },
+      "Llama-3 70B (Q4)": {
+        "weight_gb": 40.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.0,
+        "kv_offload_tps": 0.0,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 719585,
+        "context_boost_ratio": 719585.0,
+        "status": "✓ 需要 SD 擴展 (溢出 32.0GB)"
+      },
+      "Mixtral 8x22B (Q4)": {
+        "weight_gb": 80.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.0,
+        "kv_offload_tps": 0.0,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 449740,
+        "context_boost_ratio": 449740.0,
+        "status": "✓ 需要 SD 擴展 (溢出 72.0GB)"
+      }
+    },
+    "use_cases": {
+      "ai_inference": {
+        "description": "AI 模型推理（LLM、Stable Diffusion）",
+        "benefit": "讓 VRAM 不足的模型可以運行",
+        "typical_boost": "從「無法運行」→「可以運行 (1-15 tok/s)」"
+      },
+      "context_window": {
+        "description": "長文本對話 Context Window 擴展",
+        "benefit": "Context 從 ~50K → ~1798K tokens",
+        "typical_boost": "最高 74x 提升"
+      },
+      "kv_cache_persistence": {
+        "description": "KV Cache 持久化（對話記憶不丟失）",
+        "benefit": "關機後 KV Cache 保留在 SD 卡，下次秒恢復",
+        "typical_boost": "TTFT 加速最高 14x（免重算 Prefill）"
+      },
+      "model_hot_swap": {
+        "description": "AI 模型卡匣（不同 SD 卡存不同模型）",
+        "benefit": "隨插即用切換模型，免下載",
+        "typical_boost": "模型切換時間從 ~5min → ~10sec"
+      }
+    },
+    "summary": {
+      "gpu": "NVIDIA GeForce RTX 4060",
+      "gpu_vram_gb": 8.0,
+      "sd_card": "SanDisk SD Express 256GB",
+      "sd_capacity_gb": 256,
+      "sd_mode": "SD Express Gen3 x1 (最高 985 MB/s)",
+      "sd_bandwidth_mbs": 985,
+      "total_effective_memory_gb": 227.6,
+      "memory_expansion_ratio": "28.4x"
+    }
+  },
+  "scenario_3_rtx4090_1tb": {
+    "bandwidth": {
+      "vram_gbs": 1008,
+      "ram_gbs": 51.2,
+      "sd_gbs": 3.85,
+      "sd_vs_vram_ratio": "1:261",
+      "sd_vs_ram_ratio": "1:13"
+    },
+    "llm_inference": {
+      "Llama-3 8B (Q4)": {
+        "weight_gb": 4.5,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 125.0,
+        "boosted_tps": 125.0,
+        "kv_offload_tps": 110.9,
+        "vram_context_tokens": 151552,
+        "boosted_context_tokens": 7332659,
+        "context_boost_ratio": 48.4,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Qwen-2.5 32B (Q4)": {
+        "weight_gb": 18.0,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 40.0,
+        "boosted_tps": 40.0,
+        "kv_offload_tps": 37.0,
+        "vram_context_tokens": 20480,
+        "boosted_context_tokens": 3611033,
+        "context_boost_ratio": 176.3,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Llama-3 70B (Q4)": {
+        "weight_gb": 40.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.2,
+        "kv_offload_tps": 0.2,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 2872442,
+        "context_boost_ratio": 2872442.0,
+        "status": "✓ 需要 SD 擴展 (溢出 16.0GB)"
+      },
+      "Mixtral 8x22B (Q4)": {
+        "weight_gb": 80.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.1,
+        "kv_offload_tps": 0.1,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 1795276,
+        "context_boost_ratio": 1795276.0,
+        "status": "✓ 需要 SD 擴展 (溢出 56.0GB)"
+      }
+    },
+    "use_cases": {
+      "ai_inference": {
+        "description": "AI 模型推理（LLM、Stable Diffusion）",
+        "benefit": "讓 VRAM 不足的模型可以運行",
+        "typical_boost": "從「無法運行」→「可以運行 (1-15 tok/s)」"
+      },
+      "context_window": {
+        "description": "長文本對話 Context Window 擴展",
+        "benefit": "Context 從 ~50K → ~7181K tokens",
+        "typical_boost": "最高 47x 提升"
+      },
+      "kv_cache_persistence": {
+        "description": "KV Cache 持久化（對話記憶不丟失）",
+        "benefit": "關機後 KV Cache 保留在 SD 卡，下次秒恢復",
+        "typical_boost": "TTFT 加速最高 14x（免重算 Prefill）"
+      },
+      "model_hot_swap": {
+        "description": "AI 模型卡匣（不同 SD 卡存不同模型）",
+        "benefit": "隨插即用切換模型，免下載",
+        "typical_boost": "模型切換時間從 ~5min → ~10sec"
+      }
+    },
+    "summary": {
+      "gpu": "NVIDIA GeForce RTX 4090",
+      "gpu_vram_gb": 24.0,
+      "sd_card": "Kioxia SD Express Extreme 1TB",
+      "sd_capacity_gb": 1024,
+      "sd_mode": "SD Express Gen4 x2 (最高 3,940 MB/s)",
+      "sd_bandwidth_mbs": 3940,
+      "total_effective_memory_gb": 900.6,
+      "memory_expansion_ratio": "37.5x"
+    }
+  },
+  "scenario_4_uhsi_rejected": null,
+  "scenario_5_amd_7900xtx": {
+    "bandwidth": {
+      "vram_gbs": 272,
+      "ram_gbs": 51.2,
+      "sd_gbs": 3.85,
+      "sd_vs_vram_ratio": "1:70",
+      "sd_vs_ram_ratio": "1:13"
+    },
+    "llm_inference": {
+      "Llama-3 8B (Q4)": {
+        "weight_gb": 4.5,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 125.0,
+        "boosted_tps": 125.0,
+        "kv_offload_tps": 110.9,
+        "vram_context_tokens": 151552,
+        "boosted_context_tokens": 7332659,
+        "context_boost_ratio": 48.4,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Qwen-2.5 32B (Q4)": {
+        "weight_gb": 18.0,
+        "fits_in_vram": true,
+        "can_run_with_sd": true,
+        "vram_only_tps": 40.0,
+        "boosted_tps": 40.0,
+        "kv_offload_tps": 37.0,
+        "vram_context_tokens": 20480,
+        "boosted_context_tokens": 3611033,
+        "context_boost_ratio": 176.3,
+        "status": "✓ VRAM 足夠 (SD 用於 KV Cache 擴展)"
+      },
+      "Llama-3 70B (Q4)": {
+        "weight_gb": 40.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.2,
+        "kv_offload_tps": 0.2,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 2872442,
+        "context_boost_ratio": 2872442.0,
+        "status": "✓ 需要 SD 擴展 (溢出 16.0GB)"
+      },
+      "Mixtral 8x22B (Q4)": {
+        "weight_gb": 80.0,
+        "fits_in_vram": false,
+        "can_run_with_sd": true,
+        "vram_only_tps": 0,
+        "boosted_tps": 0.1,
+        "kv_offload_tps": 0.1,
+        "vram_context_tokens": 0,
+        "boosted_context_tokens": 1795276,
+        "context_boost_ratio": 1795276.0,
+        "status": "✓ 需要 SD 擴展 (溢出 56.0GB)"
+      }
+    },
+    "use_cases": {
+      "ai_inference": {
+        "description": "AI 模型推理（LLM、Stable Diffusion）",
+        "benefit": "讓 VRAM 不足的模型可以運行",
+        "typical_boost": "從「無法運行」→「可以運行 (1-15 tok/s)」"
+      },
+      "context_window": {
+        "description": "長文本對話 Context Window 擴展",
+        "benefit": "Context 從 ~50K → ~7181K tokens",
+        "typical_boost": "最高 47x 提升"
+      },
+      "kv_cache_persistence": {
+        "description": "KV Cache 持久化（對話記憶不丟失）",
+        "benefit": "關機後 KV Cache 保留在 SD 卡，下次秒恢復",
+        "typical_boost": "TTFT 加速最高 14x（免重算 Prefill）"
+      },
+      "model_hot_swap": {
+        "description": "AI 模型卡匣（不同 SD 卡存不同模型）",
+        "benefit": "隨插即用切換模型，免下載",
+        "typical_boost": "模型切換時間從 ~5min → ~10sec"
+      }
+    },
+    "summary": {
+      "gpu": "AMD Radeon RX 7900 XTX",
+      "gpu_vram_gb": 24.0,
+      "sd_card": "Kioxia SD Express Extreme 1TB",
+      "sd_capacity_gb": 1024,
+      "sd_mode": "SD Express Gen4 x2 (最高 3,940 MB/s)",
+      "sd_bandwidth_mbs": 3940,
+      "total_effective_memory_gb": 900.6,
+      "memory_expansion_ratio": "37.5x"
+    }
+  }
+}

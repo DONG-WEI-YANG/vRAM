@@ -1,0 +1,23 @@
+flowchart LR
+    subgraph STEP1["Step 1：硬體安裝"]
+        A["安裝 PCIe 擴充卡<br/>或連接 USB4 外接盒"]
+    end
+    
+    subgraph STEP2["Step 2：安裝驅動"]
+        B["安裝 SD-VRAM Booster<br/>驅動程式<br/>(Windows .exe / Linux .deb)"]
+    end
+    
+    subgraph STEP3["Step 3：插入 SD 卡"]
+        C["插入 SD Express 卡<br/>系統自動偵測規格<br/>顯示可用擴展容量"]
+    end
+    
+    subgraph STEP4["Step 4：啟動 AI"]
+        D["開啟 Ollama / PyTorch<br/>模型自動使用<br/>擴展後的 VRAM"]
+    end
+
+    STEP1 --> STEP2 --> STEP3 --> STEP4
+
+    style STEP1 fill:#E3F2FD,stroke:#1565C0
+    style STEP2 fill:#E8F5E9,stroke:#2E7D32
+    style STEP3 fill:#FFF3E0,stroke:#E65100
+    style STEP4 fill:#F3E5F5,stroke:#7B1FA2

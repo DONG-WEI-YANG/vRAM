@@ -1,0 +1,20 @@
+graph LR
+    subgraph "資料流向 Data Flow"
+        direction LR
+        
+        APP["AI 應用程式<br/>cudaMalloc(40GB)"] -->|"攔截"| SHIM["CUDA Shim<br/>libsdvram_cuda.so"]
+        
+        SHIM -->|"12GB 熱資料"| VRAM["GPU VRAM<br/>12GB GDDR6X<br/>1,008 GB/s"]
+        SHIM -->|"16GB 溫資料"| RAM["System RAM<br/>DDR5<br/>89.6 GB/s"]
+        SHIM -->|"12GB 冷資料"| SD["SD Express 陣列<br/>4x 1TB Cards<br/>15.6 GB/s"]
+        
+        VRAM -->|"預取"| PREFETCH["預測性預取引擎<br/>Predictive Prefetcher"]
+        PREFETCH -->|"提前載入<br/>下一層權重"| SD
+    end
+    
+    style VRAM fill:#FF6666,stroke:#333,color:#000
+    style RAM fill:#6688FF,stroke:#333,color:#fff
+    style SD fill:#FFD700,stroke:#333,color:#000
+    style SHIM fill:#44BB44,stroke:#333,color:#fff
+    style APP fill:#DDD,stroke:#333,color:#000
+    style PREFETCH fill:#FF9944,stroke:#333,color:#000

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.tar.gz
+.pytest_cache/
+.vram_speed_test
+vram_boost.swap

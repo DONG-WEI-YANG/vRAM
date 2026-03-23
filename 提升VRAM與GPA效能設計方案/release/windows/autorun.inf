@@ -1,0 +1,10 @@
+[autorun]
+label=VRAM Booster
+icon=VRAM_Booster.exe,0
+action=啟動 VRAM 擴展
+open=VRAM_Booster.exe
+
+[Content]
+MusicFiles=false
+PictureFiles=false
+VideoFiles=false

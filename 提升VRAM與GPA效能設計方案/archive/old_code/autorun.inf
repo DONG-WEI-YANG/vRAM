@@ -1,0 +1,7 @@
+[autorun]
+label=SD-VRAM Booster
+icon=windows\icon.ico
+open=windows\SDVRAMBooster.exe
+action=啟動 SD-VRAM Booster
+shell\open\command=windows\SDVRAMBooster.exe
+shell\open=啟動 VRAM 擴展

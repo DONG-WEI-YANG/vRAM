@@ -1,0 +1,53 @@
+graph TB
+    subgraph "SD-VRAM Booster 系統架構"
+        direction TB
+        
+        subgraph APP["應用層 Application Layer"]
+            A1["PyTorch / TensorFlow"]
+            A2["Ollama / LLM Studio"]
+            A3["Stable Diffusion"]
+        end
+
+        subgraph SHIM["CUDA 攔截層 CUDA Intercept Layer"]
+            B1["libsdvram_cuda.so<br/>LD_PRELOAD Shim"]
+            B2["cudaMalloc 攔截器"]
+            B3["預測性預取引擎<br/>Predictive Prefetcher"]
+        end
+
+        subgraph KERNEL["核心驅動層 Kernel Driver"]
+            C1["VRAM Paging<br/>Kernel Module"]
+            C2["DMA-BUF 管理器"]
+            C3["磨損均衡控制器<br/>Wear Leveling"]
+        end
+
+        subgraph HW["硬體層 Hardware Layer"]
+            direction LR
+            subgraph GPU_MEM["L1: GPU VRAM"]
+                D1["GDDR6X<br/>~1,008 GB/s<br/>熱資料"]
+            end
+            subgraph SYS_RAM["L2: 系統 RAM"]
+                D2["DDR5<br/>~64-100 GB/s<br/>溫資料"]
+            end
+            subgraph SD_ARRAY["L3: SD Express 陣列"]
+                D3["SD Express #1<br/>PCIe Gen4 x2<br/>~3.9 GB/s"]
+                D4["SD Express #2<br/>PCIe Gen4 x2<br/>~3.9 GB/s"]
+                D5["SD Express #3<br/>PCIe Gen4 x2<br/>~3.9 GB/s"]
+                D6["SD Express #4<br/>PCIe Gen4 x2<br/>~3.9 GB/s"]
+            end
+        end
+    end
+
+    A1 --> B1
+    A2 --> B1
+    A3 --> B1
+    B1 --> B2
+    B2 --> B3
+    B3 --> C1
+    C1 --> C2
+    C1 --> C3
+    C2 --> D1
+    C2 --> D2
+    C2 --> D3
+    C2 --> D4
+    C2 --> D5
+    C2 --> D6

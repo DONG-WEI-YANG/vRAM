@@ -1,0 +1,416 @@
+"""
+Real Memory Expansion Engine
+==============================
+真正的系統記憶體擴展 — 不是 GUI 模擬。
+
+做什麼：
+  Windows: 在儲存裝置上建立 pagefile (分頁檔)
+  Linux:   在儲存裝置上建立 swap file
+
+效果：
+  系統可用記憶體立即增加 → 任何 AI 軟體自動受益
+  Ollama/llama.cpp 載入大模型時，溢出的部分自動用 SD 卡
+
+原理：
+  AI 推理引擎 (Ollama/llama.cpp) 載入超過 RAM 的模型時：
+    1. 模型權重先載入 RAM
+    2. RAM 不夠 → OS 自動把最冷的頁面 swap 到 SD 卡
+    3. GPU 需要某層權重 → OS 從 SD 卡讀回 RAM → 送給 GPU
+    4. 整個過程對應用程式完全透明
+
+這跟 NVIDIA GreenBoost 的「T3: NVMe swap」層是同樣的機制，
+只是我們用 SD 卡/USB 碟代替 NVMe SSD。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import platform
+import subprocess
+import shutil
+import time
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple
+
+logger = logging.getLogger(__name__)
+
+# 根據隨機寫入速度決定 swap 大小上限
+# swap/pagefile 是隨機 4KB 頁面 I/O，不是順序讀寫
+SWAP_LIMIT_BY_RAND_WRITE_MBS = [
+    # (rand_write_mbs 下限, swap 上限 bytes)
+    (200, 0),                    # >= 200 MB/s → 不限制 (用 0 表示)
+    (50,  128 * (1024 ** 3)),    # >= 50  MB/s → 最大 128 GB
+    (10,  32 * (1024 ** 3)),     # >= 10  MB/s → 最大 32 GB
+    (0,   8 * (1024 ** 3)),      # <  10  MB/s → 最大 8 GB (SD UHS-I 等)
+]
+
+
+class RealBoostEngine:
+    """
+    真實的記憶體擴展引擎。
+
+    activate() → 在裝置上建立 swap/pagefile → 系統記憶體立即增加
+    deactivate() → 移除 swap/pagefile → 恢復原狀
+    status() → 回傳真實的記憶體使用量
+    """
+
+    SWAP_FILENAME = "vram_boost.swap"
+
+    def __init__(self):
+        self._is_windows = platform.system().lower() == "windows"
+        self._active = False
+        self._swap_path: Optional[Path] = None
+        self._swap_size_bytes: int = 0
+        self._device_letter = ""
+        self._original_mem: Dict[str, int] = {}
+        self._measured_rand_write_mbs: float = 0.0
+
+    def activate(self, drive_letter: str, use_percent: float = 80.0) -> Dict[str, Any]:
+        """
+        在指定磁碟上建立 swap/pagefile，立即擴展系統記憶體。
+
+        會先測速，根據隨機寫入效能限制 swap 大小，避免慢速裝置凍結系統。
+
+        Args:
+            drive_letter: 磁碟代號 (e.g., "E")
+            use_percent: 使用可用空間的百分比 (預設 80%)
+
+        Returns: {"success": bool, "added_gb": float, "total_mem_gb": float, ...}
+        """
+        if self._active:
+            return {"success": False, "error": "Already active"}
+
+        # 記錄原始記憶體
+        self._original_mem = self.get_system_memory()
+        self._device_letter = drive_letter
+
+        # 測速：用 4MB 隨機寫入測試裝置真實效能
+        mount = f"{drive_letter}:\\" if self._is_windows else drive_letter
+        self._measured_rand_write_mbs = self._benchmark_random_write(mount)
+        logger.info("Device speed test: random write = %.1f MB/s", self._measured_rand_write_mbs)
+
+        if self._is_windows:
+            return self._activate_windows(drive_letter, use_percent)
+        else:
+            return self._activate_linux(drive_letter, use_percent)
+
+    @staticmethod
+    def _benchmark_random_write(mount_path: str, test_size_mb: int = 4) -> float:
+        """
+        用隨機 4KB 寫入測試裝置速度，模擬 swap/pagefile 的真實 I/O 模式。
+        Returns: 隨機寫入速度 (MB/s)
+        """
+        test_file = Path(mount_path) / ".vram_speed_test"
+        block_4kb = os.urandom(4096)
+        total_bytes = test_size_mb * 1024 * 1024
+        num_writes = total_bytes // 4096
+
+        try:
+            # 先建立測試檔案
+            with open(test_file, "wb") as f:
+                f.seek(total_bytes - 1)
+                f.write(b"\0")
+
+            # 隨機位置寫入 4KB 區塊
+            import random
+            offsets = [random.randint(0, num_writes - 1) * 4096 for _ in range(num_writes)]
+
+            start = time.perf_counter()
+            with open(test_file, "r+b", buffering=0) as f:
+                for off in offsets:
+                    f.seek(off)
+                    f.write(block_4kb)
+                f.flush()
+                os.fsync(f.fileno())
+            elapsed = time.perf_counter() - start
+
+            speed_mbs = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            return speed_mbs
+
+        except OSError as e:
+            logger.warning("Speed test failed: %s", e)
+            return 5.0  # 保守預設：假設很慢
+        finally:
+            try:
+                test_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _cap_swap_by_speed(self, swap_bytes: int) -> Tuple[int, str]:
+        """
+        根據實測隨機寫入速度限制 swap 大小。
+        Returns: (capped_bytes, warning_message or "")
+        """
+        speed = self._measured_rand_write_mbs
+
+        for threshold, max_bytes in SWAP_LIMIT_BY_RAND_WRITE_MBS:
+            if speed >= threshold:
+                if max_bytes == 0:
+                    return swap_bytes, ""  # 不限制
+                if swap_bytes <= max_bytes:
+                    return swap_bytes, ""  # 未超過上限
+                capped_gb = max_bytes / (1024 ** 3)
+                original_gb = swap_bytes / (1024 ** 3)
+                warning = (
+                    f"裝置隨機寫入 {speed:.0f} MB/s，swap 從 {original_gb:.0f}GB "
+                    f"限制到 {capped_gb:.0f}GB 以避免系統凍結"
+                )
+                logger.warning(warning)
+                return max_bytes, warning
+
+        return swap_bytes, ""
+
+    def deactivate(self) -> Dict[str, Any]:
+        """移除 swap/pagefile，恢復原狀"""
+        if not self._active:
+            return {"success": True, "note": "Not active"}
+
+        if self._is_windows:
+            return self._deactivate_windows()
+        else:
+            return self._deactivate_linux()
+
+    def status(self) -> Dict[str, Any]:
+        """取得真實的系統記憶體狀態"""
+        mem = self.get_system_memory()
+        return {
+            "active": self._active,
+            "swap_path": str(self._swap_path) if self._swap_path else None,
+            "swap_size_gb": self._swap_size_bytes / (1024 ** 3),
+            "physical_ram_gb": mem.get("physical_total", 0) / (1024 ** 3),
+            "available_ram_gb": mem.get("physical_available", 0) / (1024 ** 3),
+            "swap_total_gb": mem.get("swap_total", 0) / (1024 ** 3),
+            "swap_used_gb": mem.get("swap_used", 0) / (1024 ** 3),
+            "total_usable_gb": (mem.get("physical_total", 0) + mem.get("swap_total", 0)) / (1024 ** 3),
+        }
+
+    @staticmethod
+    def get_system_memory() -> Dict[str, int]:
+        """取得系統記憶體真實數據"""
+        mem = {"physical_total": 0, "physical_available": 0, "swap_total": 0, "swap_used": 0}
+
+        if platform.system().lower() == "windows":
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_OperatingSystem | "
+                     "Select-Object TotalVisibleMemorySize,FreePhysicalMemory,"
+                     "TotalVirtualMemorySize,FreeVirtualMemory | ConvertTo-Json"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    import json
+                    d = json.loads(r.stdout)
+                    mem["physical_total"] = d.get("TotalVisibleMemorySize", 0) * 1024
+                    mem["physical_available"] = d.get("FreePhysicalMemory", 0) * 1024
+                    total_virtual = d.get("TotalVirtualMemorySize", 0) * 1024
+                    mem["swap_total"] = total_virtual - mem["physical_total"]
+                    free_virtual = d.get("FreeVirtualMemory", 0) * 1024
+                    mem["swap_used"] = mem["swap_total"] - (free_virtual - mem["physical_available"])
+            except Exception:
+                pass
+        else:
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        parts = line.split()
+                        if parts[0] == "MemTotal:":
+                            mem["physical_total"] = int(parts[1]) * 1024
+                        elif parts[0] == "MemAvailable:":
+                            mem["physical_available"] = int(parts[1]) * 1024
+                        elif parts[0] == "SwapTotal:":
+                            mem["swap_total"] = int(parts[1]) * 1024
+                        elif parts[0] == "SwapFree:":
+                            swap_free = int(parts[1]) * 1024
+                            mem["swap_used"] = mem["swap_total"] - swap_free
+            except Exception:
+                pass
+
+        return mem
+
+    @staticmethod
+    def get_gpu_info() -> Dict[str, Any]:
+        """取得 GPU 真實資訊"""
+        info = {"name": "Unknown", "vram_total_mb": 0, "vram_used_mb": 0, "vram_free_mb": 0}
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                parts = r.stdout.strip().split(",")
+                if len(parts) >= 4:
+                    info["name"] = parts[0].strip()
+                    info["vram_total_mb"] = int(parts[1].strip())
+                    info["vram_used_mb"] = int(parts[2].strip())
+                    info["vram_free_mb"] = int(parts[3].strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return info
+
+    # ── Windows: Pagefile ──
+
+    def _activate_windows(self, letter: str, use_pct: float) -> Dict[str, Any]:
+        """在 Windows 上建立 pagefile"""
+        mount = f"{letter}:\\"
+        try:
+            usage = shutil.disk_usage(mount)
+        except OSError as e:
+            return {"success": False, "error": f"Cannot access {mount}: {e}"}
+
+        # 計算 swap 大小 (可用空間的 use_pct%)
+        swap_bytes = int(usage.free * (use_pct / 100))
+
+        # 根據裝置速度限制 swap 大小
+        swap_bytes, speed_warning = self._cap_swap_by_speed(swap_bytes)
+
+        swap_mb = swap_bytes // (1024 * 1024)
+
+        if swap_mb < 512:
+            return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
+
+        swap_path = f"{letter}:\\{self.SWAP_FILENAME}"
+
+        try:
+            # 用 wmic 建立 pagefile (需要管理員權限)
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_path.replace(chr(92), chr(92)+chr(92))}'\" -ErrorAction SilentlyContinue; "
+                 f"if (-not $pf) {{ "
+                 f"  $pf = ([WmiClass]'Win32_PageFileSetting').CreateInstance(); "
+                 f"  $pf.Name = '{swap_path}'; "
+                 f"  $pf.InitialSize = {swap_mb}; "
+                 f"  $pf.MaximumSize = {swap_mb}; "
+                 f"  $pf.Put() "
+                 f"}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            if r.returncode != 0:
+                return {
+                    "success": False,
+                    "error": "需要管理員權限才能建立 pagefile。請以系統管理員身份執行。",
+                    "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+                }
+
+            self._swap_path = Path(swap_path)
+            self._swap_size_bytes = swap_bytes
+            self._active = True
+
+            after_mem = self.get_system_memory()
+            added_gb = swap_bytes / (1024 ** 3)
+
+            logger.info("Windows pagefile created: %s (%.1fGB)", swap_path, added_gb)
+
+            result = {
+                "success": True,
+                "method": "pagefile",
+                "swap_path": swap_path,
+                "added_gb": round(added_gb, 1),
+                "total_usable_gb": round(after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
+                "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+            }
+            if speed_warning:
+                result["warning"] = speed_warning
+            return result
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # 已移除 _activate_windows_fallback：
+    # 舊的 fallback 建立稀疏檔案但從未 mmap()，報告成功卻實際增加 0 bytes 記憶體。
+    # pagefile 建立需要管理員權限，沒有安全的非特權替代方案。
+
+    def _deactivate_windows(self) -> Dict[str, Any]:
+        """移除 Windows pagefile/swap"""
+        if self._swap_path:
+            try:
+                # 嘗試移除 WMI pagefile
+                swap_str = str(self._swap_path).replace("\\", "\\\\")
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_str}'\" -ErrorAction SilentlyContinue; "
+                     "if ($pf) { $pf.Delete() }"],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+
+            # 刪除檔案
+            try:
+                self._swap_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self._active = False
+        self._swap_path = None
+        self._swap_size_bytes = 0
+        logger.info("Windows swap deactivated")
+        return {"success": True}
+
+    # ── Linux: Swap File ──
+
+    def _activate_linux(self, mount_point: str, use_pct: float) -> Dict[str, Any]:
+        """在 Linux 上建立 swap file"""
+        try:
+            usage = shutil.disk_usage(mount_point)
+        except OSError as e:
+            return {"success": False, "error": str(e)}
+
+        swap_bytes = int(usage.free * (use_pct / 100))
+
+        # 根據裝置速度限制 swap 大小
+        swap_bytes, speed_warning = self._cap_swap_by_speed(swap_bytes)
+
+        swap_mb = swap_bytes // (1024 * 1024)
+        swap_path = Path(mount_point) / self.SWAP_FILENAME
+
+        if swap_mb < 512:
+            return {"success": False, "error": f"Not enough space: {swap_mb}MB"}
+
+        try:
+            # 建立 swap 檔案
+            subprocess.run(
+                ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
+                capture_output=True, timeout=300, check=True,
+            )
+            subprocess.run(["chmod", "600", str(swap_path)], check=True)
+            subprocess.run(["mkswap", str(swap_path)], capture_output=True, check=True)
+            subprocess.run(["swapon", str(swap_path)], capture_output=True, check=True)
+
+            self._swap_path = swap_path
+            self._swap_size_bytes = swap_bytes
+            self._active = True
+
+            added_gb = swap_bytes / (1024 ** 3)
+            logger.info("Linux swap activated: %s (%.1fGB)", swap_path, added_gb)
+
+            result = {
+                "success": True,
+                "method": "swap_file",
+                "swap_path": str(swap_path),
+                "added_gb": round(added_gb, 1),
+                "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+            }
+            if speed_warning:
+                result["warning"] = speed_warning
+            return result
+
+        except subprocess.CalledProcessError as e:
+            return {"success": False, "error": str(e)}
+
+    def _deactivate_linux(self) -> Dict[str, Any]:
+        if self._swap_path:
+            try:
+                subprocess.run(["swapoff", str(self._swap_path)], capture_output=True, timeout=30)
+                self._swap_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        self._active = False
+        self._swap_path = None
+        self._swap_size_bytes = 0
+        logger.info("Linux swap deactivated")
+        return {"success": True}
