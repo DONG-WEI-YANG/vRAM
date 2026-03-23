@@ -35,6 +35,21 @@ from typing import Optional, Dict, Any, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
+# Windows: 隱藏子程序視窗
+_NO_WINDOW = 0
+if platform.system().lower() == "windows":
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW  # 0x08000000
+
+
+def _run_hidden(cmd, **kwargs):
+    """執行子程序，Windows 上不彈出視窗"""
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    if _NO_WINDOW:
+        kwargs.setdefault("creationflags", _NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)  # noqa: used by _run_hidden only
+
+
 # swap 大小 = 實測隨機寫入速度 × 可接受的最大寫滿秒數
 # 原理：OS 高壓 swap 時可能寫滿整個 swap 空間，
 #       寫滿時間過長 → 用戶感覺系統凍結。
@@ -83,10 +98,10 @@ class RealBoostEngine:
         if platform.system().lower() == "windows":
             letter = mount_path.rstrip(":\\/ ")[0]
             try:
-                r = subprocess.run(
+                r = _run_hidden(
                     ["powershell", "-NoProfile", "-Command",
                      f"(Get-Volume -DriveLetter {letter} -ErrorAction Stop).FileSystemLabel"],
-                    capture_output=True, text=True, timeout=5,
+                    timeout=5,
                 )
                 if r.returncode == 0:
                     label = r.stdout.strip()
@@ -95,9 +110,9 @@ class RealBoostEngine:
         else:
             # Linux: 用 lsblk 取得檔案系統 label
             try:
-                r = subprocess.run(
+                r = _run_hidden(
                     ["lsblk", "-J", "-o", "MOUNTPOINT,LABEL"],
-                    capture_output=True, text=True, timeout=5,
+                    timeout=5,
                 )
                 if r.returncode == 0:
                     import json
@@ -416,10 +431,10 @@ class RealBoostEngine:
 
         info = {"name": "Unknown", "vram_total_mb": 0, "vram_used_mb": 0, "vram_free_mb": 0}
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10,
+                timeout=10,
             )
             if r.returncode == 0:
                 parts = r.stdout.strip().split(",")
@@ -551,9 +566,9 @@ class RealBoostEngine:
         )
 
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=30,
+                timeout=30,
             )
 
             stdout = r.stdout.strip()
@@ -584,14 +599,14 @@ class RealBoostEngine:
             escaped = str(self._swap_path).replace("'", "''").replace("\\", "\\\\")
             try:
                 # 移除我們的 pagefile 設定 + 恢復自動管理
-                subprocess.run(
+                _run_hidden(
                     ["powershell", "-NoProfile", "-Command",
                      "$ErrorActionPreference = 'SilentlyContinue'; "
                      f"$pf = Get-CimInstance Win32_PageFileSetting -Filter \"Name='{escaped}'\"; "
                      "if ($pf) { Remove-CimInstance -InputObject $pf }; "
                      "$sys = Get-CimInstance Win32_ComputerSystem; "
                      "Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$true}"],
-                    capture_output=True, timeout=10,
+                    timeout=10,
                 )
             except (subprocess.TimeoutExpired, OSError) as e:
                 logger.warning("Pagefile deregistration error: %s", e)
@@ -640,17 +655,17 @@ class RealBoostEngine:
         try:
             if not reuse:
                 report(f"建立 swap 檔案 ({swap_mb // 1024}GB)，請稍候...")
-                subprocess.run(
+                _run_hidden(
                     ["dd", "if=/dev/zero", f"of={swap_path}", "bs=1M", f"count={swap_mb}"],
-                    capture_output=True, timeout=300, check=True,
+                    timeout=300, check=True,
                 )
                 report("設定 swap 權限...")
-                subprocess.run(["chmod", "600", str(swap_path)], check=True)
+                _run_hidden(["chmod", "600", str(swap_path)], check=True)
                 report("格式化 swap...")
-                subprocess.run(["mkswap", str(swap_path)], capture_output=True, check=True)
+                _run_hidden(["mkswap", str(swap_path)], check=True)
 
             report("啟用 swap...")
-            subprocess.run(["swapon", str(swap_path)], capture_output=True, check=True)
+            _run_hidden(["swapon", str(swap_path)], check=True)
 
             self._swap_path = swap_path
             self._swap_size_bytes = swap_bytes
@@ -680,7 +695,7 @@ class RealBoostEngine:
         """取消 swap，但保留檔案供下次快速啟動"""
         if self._swap_path:
             try:
-                subprocess.run(["swapoff", str(self._swap_path)], capture_output=True, timeout=30)
+                _run_hidden(["swapoff", str(self._swap_path)], timeout=30)
                 # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
                 logger.info("Swap disabled, file kept for reuse: %s", self._swap_path)
             except (subprocess.TimeoutExpired, OSError) as e:

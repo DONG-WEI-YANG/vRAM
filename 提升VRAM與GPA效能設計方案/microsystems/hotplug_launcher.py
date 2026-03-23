@@ -29,6 +29,20 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Windows: 隱藏子程序視窗
+_NO_WINDOW = 0
+if platform.system().lower() == "windows":
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW
+
+
+def _run_hidden(cmd, **kwargs):
+    """執行子程序，Windows 上不彈出視窗"""
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    if _NO_WINDOW:
+        kwargs.setdefault("creationflags", _NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
+
 
 def get_my_drive() -> Optional[str]:
     """找到自己所在的磁碟機代號"""
@@ -57,11 +71,11 @@ def get_my_drive() -> Optional[str]:
     # 3. Fallback: 掃描所有可移除式磁碟
     if platform.system().lower() == "windows":
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-Volume | Where-Object {$_.DriveType -eq 'Removable' -and $_.DriveLetter -and $_.Size -gt 0} "
                  "| Select-Object DriveLetter | ConvertTo-Json"],
-                capture_output=True, text=True, timeout=8,
+                timeout=8,
             )
             if r.returncode == 0 and r.stdout.strip():
                 data = json.loads(r.stdout)
@@ -75,9 +89,9 @@ def get_my_drive() -> Optional[str]:
     else:
         # Linux: 掃描可移除式掛載點
         try:
-            r = subprocess.run(
+            r = _run_hidden(
                 ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,SIZE,TYPE"],
-                capture_output=True, text=True, timeout=8,
+                timeout=8,
             )
             if r.returncode == 0:
                 data = json.loads(r.stdout)
@@ -119,11 +133,11 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
 
     try:
         # Volume info
-        r = subprocess.run(
+        r = _run_hidden(
             ["powershell", "-NoProfile", "-Command",
              f"Get-Volume -DriveLetter {letter} -ErrorAction Stop | "
              "Select-Object FileSystemLabel,FileSystem,Size,SizeRemaining,DriveType | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=8,
+            timeout=8,
         )
         if r.returncode == 0 and r.stdout.strip():
             v = json.loads(r.stdout)
@@ -134,20 +148,20 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
             info["is_removable"] = v.get("DriveType") == "Removable"
 
         # Physical disk info
-        r2 = subprocess.run(
+        r2 = _run_hidden(
             ["powershell", "-NoProfile", "-Command",
              f"Get-Partition -DriveLetter {letter} -ErrorAction Stop | "
              "Select-Object DiskNumber | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=8,
+            timeout=8,
         )
         if r2.returncode == 0 and r2.stdout.strip():
             dn = json.loads(r2.stdout).get("DiskNumber")
             if dn is not None:
-                r3 = subprocess.run(
+                r3 = _run_hidden(
                     ["powershell", "-NoProfile", "-Command",
                      f"Get-PhysicalDisk -DeviceNumber {dn} -ErrorAction Stop | "
                      "Select-Object FriendlyName,BusType,MediaType,SpindleSpeed | ConvertTo-Json"],
-                    capture_output=True, text=True, timeout=8,
+                    timeout=8,
                 )
                 if r3.returncode == 0 and r3.stdout.strip():
                     pd = json.loads(r3.stdout)
@@ -198,9 +212,9 @@ def _detect_device_type_linux(info: Dict, mount_point: str) -> Dict:
 
     try:
         # 找到掛載點對應的區塊裝置
-        r = subprocess.run(
+        r = _run_hidden(
             ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,TRAN,ROTA,MODEL,FSTYPE,LABEL,TYPE"],
-            capture_output=True, text=True, timeout=8,
+            timeout=8,
         )
         if r.returncode != 0:
             return info
