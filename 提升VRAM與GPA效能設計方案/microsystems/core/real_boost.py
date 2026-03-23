@@ -516,91 +516,88 @@ class RealBoostEngine:
     @staticmethod
     def _register_pagefile_windows(swap_path: str, size_mb: int) -> Tuple[bool, str]:
         """
-        嘗試多種方式在 Windows 建立 pagefile，回傳 (success, error_detail)。
-        即使以管理員執行，WMI 也可能因各種原因失敗，所以有 fallback。
+        在 Windows 上建立 pagefile。
+
+        關鍵：Windows 11 預設 AutomaticManagedPagefile=true，
+        此模式下任何手動 pagefile 設定都會被忽略。
+        必須先關閉自動管理，再建立手動 pagefile。
+
+        使用 CIM (Get-CimInstance) — Windows 10/11 原生支援，
+        比已廢棄的 WMI/wmic 更可靠。
         """
-        escaped_path = swap_path.replace("\\", "\\\\")
+        # 單一 PowerShell 呼叫完成所有步驟：
+        # 1. 關閉自動管理 (如果開著)
+        # 2. 檢查此路徑的 pagefile 是否已註冊
+        # 3. 沒有則建立新的
+        escaped = swap_path.replace("'", "''")
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'; "
+            # Step 1: 關閉自動管理
+            "$sys = Get-CimInstance Win32_ComputerSystem; "
+            "if ($sys.AutomaticManagedPagefile) { "
+            "  Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$false}; "
+            "  Write-Host 'AutoManaged OFF' "
+            "}; "
+            # Step 2: 檢查是否已存在
+            f"$existing = Get-CimInstance Win32_PageFileSetting -Filter \"Name='{escaped.replace(chr(92), chr(92)+chr(92))}'\"; "
+            "if ($existing) { "
+            "  Write-Host 'Already registered'; "
+            "  exit 0 "
+            "}; "
+            # Step 3: 建立新 pagefile
+            f"New-CimInstance -ClassName Win32_PageFileSetting "
+            f"-Property @{{Name='{escaped}'; InitialSize={size_mb}; MaximumSize={size_mb}}}; "
+            "Write-Host 'Pagefile created'"
+        )
 
-        # 方法 1: WMI Win32_PageFileSetting
         try:
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{escaped_path}'\" -ErrorAction SilentlyContinue; "
-                 f"if (-not $pf) {{ "
-                 f"  $pf = ([WmiClass]'Win32_PageFileSetting').CreateInstance(); "
-                 f"  $pf.Name = '{swap_path}'; "
-                 f"  $pf.InitialSize = {size_mb}; "
-                 f"  $pf.MaximumSize = {size_mb}; "
-                 f"  $pf.Put() "
-                 f"}}"],
+                ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True, text=True, timeout=30,
             )
+
+            stdout = r.stdout.strip()
+            stderr = r.stderr.strip()
+
             if r.returncode == 0:
-                logger.info("Pagefile registered via WMI")
+                logger.info("Pagefile registered: %s", stdout)
                 return True, ""
-            wmi_err = (r.stderr or r.stdout).strip()
-            logger.warning("WMI method failed: %s", wmi_err)
+
+            # 真實錯誤回報
+            err = stderr or stdout or "Unknown error"
+            logger.error("Pagefile registration failed: %s", err)
+
+            # 常見錯誤翻譯
+            if "Access" in err or "denied" in err.lower():
+                return False, f"權限不足: {err}"
+            if "AutomaticManagedPagefile" in err:
+                return False, f"無法關閉自動管理分頁檔: {err}"
+
+            return False, f"Pagefile 建立失敗: {err}"
+
         except subprocess.TimeoutExpired:
-            wmi_err = "WMI timeout"
-
-        # 方法 2: wmic pagefile (舊版 Windows 相容)
-        try:
-            r = subprocess.run(
-                ["wmic", "pagefileset", "create",
-                 f"name=\"{swap_path}\"",
-                 f"InitialSize={size_mb}",
-                 f"MaximumSize={size_mb}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if r.returncode == 0:
-                logger.info("Pagefile registered via wmic")
-                return True, ""
-            wmic_err = (r.stderr or r.stdout).strip()
-            logger.warning("wmic method failed: %s", wmic_err)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            wmic_err = "wmic not available"
-
-        # 方法 3: PowerShell Set-CimInstance (Windows 10+)
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"$sys = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; "
-                 f"if ($sys.AutomaticManagedPagefile) {{ "
-                 f"  $sys | Set-CimInstance -Property @{{AutomaticManagedPagefile=$false}} "
-                 f"}}; "
-                 f"New-CimInstance -ClassName Win32_PageFileSetting "
-                 f"-Property @{{Name='{swap_path}'; InitialSize={size_mb}; MaximumSize={size_mb}}} "
-                 f"-ErrorAction Stop"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if r.returncode == 0:
-                logger.info("Pagefile registered via CIM")
-                return True, ""
-            cim_err = (r.stderr or r.stdout).strip()
-            logger.warning("CIM method failed: %s", cim_err)
-        except subprocess.TimeoutExpired:
-            cim_err = "CIM timeout"
-
-        # 全部失敗 — 回報真實錯誤
-        return False, f"Pagefile 建立失敗（已以管理員執行）: {wmi_err}"
+            return False, "PowerShell 逾時 (30s)"
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """取消 Windows pagefile 註冊，但保留檔案供下次快速啟動"""
+        """取消 Windows pagefile 註冊，恢復自動管理，但保留 swap 檔案"""
         if self._swap_path:
+            escaped = str(self._swap_path).replace("'", "''").replace("\\", "\\\\")
             try:
-                # 取消 WMI pagefile 註冊
-                swap_str = str(self._swap_path).replace("\\", "\\\\")
+                # 移除我們的 pagefile 設定 + 恢復自動管理
                 subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
-                     f"$pf = Get-WmiObject Win32_PageFileSetting -Filter \"Name='{swap_str}'\" -ErrorAction SilentlyContinue; "
-                     "if ($pf) { $pf.Delete() }"],
+                     "$ErrorActionPreference = 'SilentlyContinue'; "
+                     f"$pf = Get-CimInstance Win32_PageFileSetting -Filter \"Name='{escaped}'\"; "
+                     "if ($pf) { Remove-CimInstance -InputObject $pf }; "
+                     "$sys = Get-CimInstance Win32_ComputerSystem; "
+                     "Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$true}"],
                     capture_output=True, timeout=10,
                 )
             except (subprocess.TimeoutExpired, OSError) as e:
                 logger.warning("Pagefile deregistration error: %s", e)
 
             # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
-            logger.info("Pagefile unregistered, file kept for reuse: %s", self._swap_path)
+            logger.info("Pagefile unregistered, auto-managed restored, file kept: %s", self._swap_path)
 
         self._active = False
         self._swap_path = None
