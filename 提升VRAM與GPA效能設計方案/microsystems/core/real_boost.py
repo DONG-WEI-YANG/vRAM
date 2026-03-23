@@ -566,9 +566,9 @@ class RealBoostEngine:
             "  Write-Host 'Already registered'; "
             "  exit 0 "
             "}; "
-            # Step 3: 建立新 pagefile
+            # Step 3: 建立新 pagefile（InitialSize/MaximumSize 必須是 UInt32）
             f"New-CimInstance -ClassName Win32_PageFileSetting "
-            f"-Property @{{Name='{escaped}'; InitialSize={size_mb}; MaximumSize={size_mb}}}; "
+            f"-Property @{{Name='{escaped}'; InitialSize=[UInt32]{size_mb}; MaximumSize=[UInt32]{size_mb}}}; "
             "Write-Host 'Pagefile created'"
         )
 

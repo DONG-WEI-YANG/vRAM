@@ -119,8 +119,11 @@ def deploy(letter: str) -> bool:
 
         with open(src, "rb") as f_in:
             data = f_in.read()
-        if existing:
-            dst.unlink()
+        try:
+            if dst.exists():
+                dst.unlink()
+        except PermissionError:
+            print(f"  [WARN] {fname} is locked, overwriting in place...")
         with open(dst, "wb") as f_out:
             f_out.write(data)
             f_out.flush()
