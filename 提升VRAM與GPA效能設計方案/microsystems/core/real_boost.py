@@ -540,18 +540,17 @@ class RealBoostEngine:
         """
         在 Windows 上建立 pagefile。
 
-        關鍵：Windows 11 預設 AutomaticManagedPagefile=true，
-        此模式下任何手動 pagefile 設定都會被忽略。
-        必須先關閉自動管理，再建立手動 pagefile。
-
-        使用 CIM (Get-CimInstance) — Windows 10/11 原生支援，
-        比已廢棄的 WMI/wmic 更可靠。
+        Windows 11 的 CIM/WMI provider 不支援 New-CimInstance 建立 pagefile。
+        最可靠的方法是直接操作 registry：
+          HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management
+            - PagingFiles (REG_MULTI_SZ): 每行一個 pagefile
+            - 格式: "路徑 初始MB 最大MB"
+        同時關閉 AutomaticManagedPagefile。
         """
-        # 單一 PowerShell 呼叫完成所有步驟：
-        # 1. 關閉自動管理 (如果開著)
-        # 2. 檢查此路徑的 pagefile 是否已註冊
-        # 3. 沒有則建立新的
-        escaped = swap_path.replace("'", "''")
+        # Registry 路徑
+        reg_key = r"HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        entry = f"{swap_path} {size_mb} {size_mb}"
+
         ps_script = (
             "$ErrorActionPreference = 'Stop'; "
             # Step 1: 關閉自動管理
@@ -560,16 +559,24 @@ class RealBoostEngine:
             "  Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$false}; "
             "  Write-Host 'AutoManaged OFF' "
             "}; "
-            # Step 2: 檢查是否已存在
-            f"$existing = Get-CimInstance Win32_PageFileSetting -Filter \"Name='{escaped.replace(chr(92), chr(92)+chr(92))}'\"; "
-            "if ($existing) { "
-            "  Write-Host 'Already registered'; "
-            "  exit 0 "
+            # Step 2: 讀取現有 pagefile 設定
+            f"$regPath = '{reg_key}'; "
+            "$current = (Get-ItemProperty $regPath -Name PagingFiles).PagingFiles; "
+            # Step 3: 檢查是否已包含此路徑
+            f"$newEntry = '{entry}'; "
+            f"$targetDrive = '{swap_path[0]}'; "
+            "$already = $false; "
+            "foreach ($pf in $current) { "
+            "  if ($pf -and $pf[0] -eq $targetDrive) { $already = $true; break } "
             "}; "
-            # Step 3: 建立新 pagefile（InitialSize/MaximumSize 必須是 UInt32）
-            f"New-CimInstance -ClassName Win32_PageFileSetting "
-            f"-Property @{{Name='{escaped}'; InitialSize=[UInt32]{size_mb}; MaximumSize=[UInt32]{size_mb}}}; "
-            "Write-Host 'Pagefile created'"
+            "if ($already) { "
+            "  Write-Host 'Already registered'; exit 0 "
+            "}; "
+            # Step 4: 加入新 pagefile
+            "if ($current -is [string]) { $current = @($current) }; "
+            "$updated = $current + $newEntry; "
+            "Set-ItemProperty $regPath -Name PagingFiles -Value $updated; "
+            "Write-Host 'Pagefile registered via registry'"
         )
 
         try:
@@ -585,15 +592,11 @@ class RealBoostEngine:
                 logger.info("Pagefile registered: %s", stdout)
                 return True, ""
 
-            # 真實錯誤回報
             err = stderr or stdout or "Unknown error"
             logger.error("Pagefile registration failed: %s", err)
 
-            # 常見錯誤翻譯
             if "Access" in err or "denied" in err.lower():
                 return False, f"權限不足: {err}"
-            if "AutomaticManagedPagefile" in err:
-                return False, f"無法關閉自動管理分頁檔: {err}"
 
             return False, f"Pagefile 建立失敗: {err}"
 
@@ -603,14 +606,19 @@ class RealBoostEngine:
     def _deactivate_windows(self) -> Dict[str, Any]:
         """取消 Windows pagefile 註冊，恢復自動管理，但保留 swap 檔案"""
         if self._swap_path:
-            escaped = str(self._swap_path).replace("'", "''").replace("\\", "\\\\")
+            target_drive = str(self._swap_path)[0]
+            reg_key = r"HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
             try:
-                # 移除我們的 pagefile 設定 + 恢復自動管理
+                # 從 registry 移除我們的 pagefile + 恢復自動管理
                 _run_hidden(
                     ["powershell", "-NoProfile", "-Command",
                      "$ErrorActionPreference = 'SilentlyContinue'; "
-                     f"$pf = Get-CimInstance Win32_PageFileSetting -Filter \"Name='{escaped}'\"; "
-                     "if ($pf) { Remove-CimInstance -InputObject $pf }; "
+                     f"$regPath = '{reg_key}'; "
+                     "$current = (Get-ItemProperty $regPath -Name PagingFiles).PagingFiles; "
+                     "if ($current -is [string]) { $current = @($current) }; "
+                     f"$filtered = $current | Where-Object {{ $_ -and $_[0] -ne '{target_drive}' }}; "
+                     "if (-not $filtered) { $filtered = @() }; "
+                     "Set-ItemProperty $regPath -Name PagingFiles -Value $filtered; "
                      "$sys = Get-CimInstance Win32_ComputerSystem; "
                      "Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$true}"],
                     timeout=10,
@@ -618,7 +626,6 @@ class RealBoostEngine:
             except (subprocess.TimeoutExpired, OSError) as e:
                 logger.warning("Pagefile deregistration error: %s", e)
 
-            # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
             logger.info("Pagefile unregistered, auto-managed restored, file kept: %s", self._swap_path)
 
         self._active = False
