@@ -36,6 +36,7 @@ from typing import Optional, Dict, Any, Tuple, Callable
 
 from .mmap_engine import MmapSwapEngine
 from .striped_swap import StripedSwapScheduler
+from .vhd_pagefile import VhdPagefileEngine
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,8 @@ class RealBoostEngine:
         self._hotdetect_thread: Optional[threading.Thread] = None
         self._hotdetect_stop = threading.Event()
         self._engine_swap_bytes: Dict[str, int] = {}  # engine.uid → swap bytes
+        self._vhd_engine: Optional[VhdPagefileEngine] = None
+        self._vhd_active: bool = False
         self._state_lock = threading.RLock()  # 保護所有共享狀態
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
@@ -384,6 +387,18 @@ class RealBoostEngine:
             result["system_pagefile_gb"] = sys_pf / (1024 ** 3)
             result["total_with_system_gb"] = (mem.get("physical_total", 0) + sys_pf + real_swap_bytes) / (1024 ** 3)
 
+        # VHD pagefile 狀態
+        if getattr(self, '_vhd_active', False) and self._vhd_engine:
+            vhd_st = self._vhd_engine.status()
+            result["vhd_active"] = True
+            result["vhd_devices"] = vhd_st.get("devices", [])
+            result["method"] = "vhd_pagefile"
+            result["system_wide"] = True
+        else:
+            result["vhd_active"] = False
+            result["method"] = "mmap_swap" if engines else "none"
+            result["system_wide"] = False
+
         # 多裝置聚合狀態
         if engines:
             total_mapped = 0
@@ -520,9 +535,72 @@ class RealBoostEngine:
     def _activate_windows(self, letter: str, use_pct: float,
                           report=None) -> Dict[str, Any]:
         """
-        多裝置 mmap swap：掃描所有外接裝置，各自建立 mmap swap。
-        零 C:\\ 佔用，資訊透過 GUI 顯示。
+        Windows 記憶體擴展：VHD pagefile 優先，mmap fallback。
+
+        策略：
+        1. 嘗試 VHD Bridge → 真正的 Windows pagefile（所有程式受益）
+        2. VHD 失敗 → fallback 到 mmap swap（只有本 process 受益）
         """
+        report = report or (lambda msg: None)
+
+        # 掃描所有外接裝置
+        drives = self._scan_external_drives(letter)
+        report(f"found {len(drives)} device(s): {', '.join(d + ':' for d in drives)}")
+
+        # ── 嘗試 VHD Bridge（主策略）──
+        report("trying VHD pagefile (system-wide benefit)...")
+        try:
+            self._vhd_engine = VhdPagefileEngine()
+            vhd_result = self._vhd_engine.activate(
+                drive_letters=drives,
+                use_percent=use_pct,
+                on_progress=report,
+            )
+
+            if vhd_result.get("success"):
+                self._vhd_active = True
+                self._active = True
+                self._swap_size_bytes = int(vhd_result.get("added_gb", 0) * (1024**3))
+
+                # Assess system pagefile
+                self._system_pf_bytes = self._get_system_pagefile_bytes()
+
+                # Start hot-detect for new devices
+                self._known_drives = set(drives)
+                self._hotdetect_stop.clear()
+                self._hotdetect_thread = threading.Thread(
+                    target=self._hot_detect_loop, daemon=True, name="hotplug-detect")
+                self._hotdetect_thread.start()
+                report("hot-detect started (30s interval)")
+
+                after_mem = self.get_system_memory()
+                return {
+                    "success": True,
+                    "method": "vhd_pagefile",
+                    "system_wide": True,
+                    "device_count": vhd_result.get("device_count", 0),
+                    "devices": vhd_result.get("devices", []),
+                    "added_gb": vhd_result.get("added_gb", 0),
+                    "system_pagefile_gb": round(self._system_pf_bytes / (1024**3), 1),
+                    "total_usable_gb": round(
+                        after_mem.get("physical_total", 0) / (1024**3) +
+                        vhd_result.get("added_gb", 0) +
+                        self._system_pf_bytes / (1024**3), 1),
+                    "needs_reboot": False,
+                }
+        except Exception as e:
+            logger.warning("VHD pagefile failed: %s, falling back to mmap", e)
+            report(f"VHD failed ({e}), trying mmap fallback...")
+            self._vhd_engine = None
+            self._vhd_active = False
+
+        # ── Fallback: mmap swap（原有邏輯）──
+        report("using mmap swap (process-level only)...")
+        return self._activate_windows_mmap(letter, use_pct, report)
+
+    def _activate_windows_mmap(self, letter: str, use_pct: float,
+                               report=None) -> Dict[str, Any]:
+        """Fallback: mmap-based swap (only benefits this process)."""
         report = report or (lambda msg: None)
 
         # 掃描所有外接裝置
@@ -647,6 +725,7 @@ class RealBoostEngine:
         return {
             "success": True,
             "method": "striped_mmap_swap" if len(self._mmap_engines) > 1 else "mmap_swap",
+            "system_wide": False,
             "system_pagefile_gb": round(self._system_pf_bytes / (1024**3), 1),
             "device_count": len(self._mmap_engines),
             "devices": device_details,
@@ -689,50 +768,66 @@ class RealBoostEngine:
 
             logger.info("Hot-detect: new device %s:", drv)
 
-            # 測速
-            cached = self._load_cached_config(mount)
-            cached_speed = cached.get("effective_speed_mbs", 0) if cached else 0
-            speed = self._benchmark_random_write(mount, test_size_mb=4)
-            seq_speed = self._benchmark_sequential_write(mount)
-            measured = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
-            effective_speed = max(measured, cached_speed)
+            if self._vhd_active and self._vhd_engine:
+                # VHD 模式：加入新裝置的 VHD pagefile
+                try:
+                    result = self._vhd_engine.activate(
+                        drive_letters=[drv], use_percent=80.0,
+                        on_progress=lambda msg: logger.info("Hot-add %s: %s", drv, msg),
+                    )
+                    if result.get("success"):
+                        with self._state_lock:
+                            self._known_drives.add(drv)
+                            self._swap_size_bytes += int(result.get("added_gb", 0) * (1024**3))
+                        logger.info("Hot-added VHD pagefile on %s:", drv)
+                except Exception as e:
+                    logger.warning("Hot-add VHD failed for %s: %s", drv, e)
+            else:
+                # mmap fallback 模式：用原有邏輯
+                # 測速
+                cached = self._load_cached_config(mount)
+                cached_speed = cached.get("effective_speed_mbs", 0) if cached else 0
+                speed = self._benchmark_random_write(mount, test_size_mb=4)
+                seq_speed = self._benchmark_sequential_write(mount)
+                measured = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
+                effective_speed = max(measured, cached_speed)
 
-            self._save_config(mount, {
-                "rand_write_mbs": speed,
-                "seq_write_mbs": seq_speed,
-                "effective_speed_mbs": effective_speed,
-                "drive_letter": drv,
-            })
+                self._save_config(mount, {
+                    "rand_write_mbs": speed,
+                    "seq_write_mbs": seq_speed,
+                    "effective_speed_mbs": effective_speed,
+                    "drive_letter": drv,
+                })
 
-            # Per-device cap
-            STRIPED_MULTIPLIER = 2.0
-            device_cap = int(effective_speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS * STRIPED_MULTIPLIER)
-            device_cap = max(device_cap, SWAP_MIN_BYTES)
-            wanted = min(int(usage.free * 0.8), device_cap)
-            swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
+                # Per-device cap
+                STRIPED_MULTIPLIER = 2.0
+                device_cap = int(effective_speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS * STRIPED_MULTIPLIER)
+                device_cap = max(device_cap, SWAP_MIN_BYTES)
+                wanted = min(int(usage.free * 0.8), device_cap)
+                swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
 
-            if swap_bytes < 512 * (1024 ** 2):
-                continue
+                if swap_bytes < 512 * (1024 ** 2):
+                    continue
 
-            # 建立 mmap swap
-            engine = MmapSwapEngine()
-            result = engine.activate(
-                device_path=mount, size_bytes=swap_bytes,
-                on_state_change=lambda state, d=drv: self._on_device_state_changed(d, state),
-            )
+                # 建立 mmap swap
+                engine = MmapSwapEngine()
+                result = engine.activate(
+                    device_path=mount, size_bytes=swap_bytes,
+                    on_state_change=lambda state, d=drv: self._on_device_state_changed(d, state),
+                )
 
-            if result.get("success"):
-                with self._state_lock:
-                    self._mmap_engines.append(engine)
-                    self._engine_swap_bytes[engine.uid] = swap_bytes
-                    self._swap_size_bytes += swap_bytes
-                    self._known_drives.add(drv)
+                if result.get("success"):
+                    with self._state_lock:
+                        self._mmap_engines.append(engine)
+                        self._engine_swap_bytes[engine.uid] = swap_bytes
+                        self._swap_size_bytes += swap_bytes
+                        self._known_drives.add(drv)
 
-                    if self._striped:
-                        self._striped.add_device(engine, effective_speed)
+                        if self._striped:
+                            self._striped.add_device(engine, effective_speed)
 
-                swap_gb = swap_bytes / (1024 ** 3)
-                logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
+                    swap_gb = swap_bytes / (1024 ** 3)
+                    logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
 
     # ── 裝置狀態變化 ──
 
@@ -832,8 +927,8 @@ class RealBoostEngine:
                 pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect。"""
-        # 停止熱偵測（SD 卡 I/O 可能卡 30s+，給足夠時間）
+        """關閉 VHD pagefile + mmap swap + striped scheduler + hot-detect。"""
+        # 停止熱偵測
         self._hotdetect_stop.set()
         if self._hotdetect_thread and self._hotdetect_thread.is_alive():
             self._hotdetect_thread.join(timeout=15)
@@ -841,6 +936,16 @@ class RealBoostEngine:
                 logger.warning("Hot-detect thread did not stop within 15s")
         self._hotdetect_thread = None
 
+        # ── VHD pagefile 清理 ──
+        if self._vhd_active and self._vhd_engine:
+            try:
+                self._vhd_engine.deactivate()
+            except Exception as e:
+                logger.warning("VHD deactivate error: %s", e)
+            self._vhd_engine = None
+            self._vhd_active = False
+
+        # ── mmap 清理（fallback 時才有） ──
         if hasattr(self, '_striped') and self._striped:
             self._striped.close()
             self._striped = None
