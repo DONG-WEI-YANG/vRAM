@@ -479,9 +479,13 @@ class RealBoostEngine:
 
         swap_bytes = swap_mb * 1024 * 1024  # 對齊到 MB
 
-        # ── Layer 1: C:\ pagefile（系統層級） ──
+        # ── Layer 1: C:\ pagefile（系統層級，上限 2GB） ──
+        # C:\ pagefile 只是讓 Task Manager 看到記憶體增加，不需要太大
+        # 高速裝置的 swap 可能 60-180GB，全放 C:\ 會造成負擔
+        PAGEFILE_CAP = 2 * (1024 ** 3)  # 2GB 上限
+        pagefile_size = min(swap_bytes, PAGEFILE_CAP)
         report("activating system pagefile...")
-        pagefile_ok = self._create_system_pagefile(swap_bytes, report)
+        pagefile_ok = self._create_system_pagefile(pagefile_size, report)
 
         # ── Layer 2: 裝置 mmap swap（AI 層級） ──
         report(f"activating device swap ({swap_mb // 1024}GB)...")
