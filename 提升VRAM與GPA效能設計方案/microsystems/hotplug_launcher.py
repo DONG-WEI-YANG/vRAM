@@ -500,6 +500,26 @@ class BoosterApp:
 
         self._info_lbls["system"].configure(text=self._system_name)
 
+        # 裝置狀態
+        device_f = tk.Frame(self._frame, bg=self.BG2, padx=12, pady=4)
+        device_f.pack(fill="x", padx=12, pady=(0, 5))
+
+        r = tk.Frame(device_f, bg=self.BG2)
+        r.pack(fill="x")
+        tk.Label(r, text="裝置狀態:", font=("Segoe UI", 8),
+                 fg=self.GRAY, bg=self.BG2, width=8, anchor="e").pack(side="left")
+        self._device_status_lbl = tk.Label(
+            r, text="● 正常", font=("Segoe UI", 8, "bold"),
+            fg=self.GREEN, bg=self.BG2, anchor="w")
+        self._device_status_lbl.pack(side="left", padx=(6, 0))
+
+        r2 = tk.Frame(device_f, bg=self.BG2)
+        r2.pack(fill="x")
+        tk.Label(r2, text="保護:", font=("Segoe UI", 8),
+                 fg=self.GRAY, bg=self.BG2, width=8, anchor="e").pack(side="left")
+        tk.Label(r2, text="智慧降級 (B+)", font=("Segoe UI", 8, "bold"),
+                 fg=self.ACCENT, bg=self.BG2, anchor="w").pack(side="left", padx=(6, 0))
+
         tk.Button(self._frame, text="停止並退出", font=("Segoe UI", 9),
                   fg=self.FG, bg="#444444", relief="flat", cursor="hand2",
                   padx=10, pady=4, command=self._quit).pack(pady=8)
@@ -548,6 +568,20 @@ class BoosterApp:
                     text=f"VRAM: {gpu['vram_free_mb']}MB free")
                 self._info_lbls["device"].configure(text=f"{self._my_drive}:\\")
 
+                # Update device status indicator
+                if hasattr(self, '_device_status_lbl'):
+                    degraded = False
+                    if hasattr(self._boost_engine, '_mmap_engine') and self._boost_engine._mmap_engine:
+                        mmap_st = self._boost_engine._mmap_engine.status()
+                        degraded = mmap_st.get("degraded", False)
+
+                    if degraded:
+                        self._device_status_lbl.configure(
+                            text="● 已斷線 — 等待重新連接", fg=self.ORANGE)
+                    else:
+                        self._device_status_lbl.configure(
+                            text=f"● 正常 ({self._my_drive}:\\)", fg=self.GREEN)
+
             except (OSError, ValueError, KeyError) as e:
                 logger.debug("Poll error: %s", e)
 
@@ -584,10 +618,8 @@ class BoosterApp:
                         rand_mbs = result.get("rand_write_mbs", 0)
                         self._system = True
                         self._engine_ready.set()
-
-                        # 切換到「成功 + 重開機提示」畫面
-                        self._root.after(0, lambda: self._show_reboot_prompt(
-                            added, rand_mbs, result.get("warning", "")))
+                        # mmap swap 立即生效，永遠不需要重開機
+                        self._root.after(0, self._show_active)
                     else:
                         error = result.get("error", "Unknown")
                         if hasattr(self, '_health_lbl'):
@@ -625,73 +657,6 @@ class BoosterApp:
             logger.warning("Deactivate timed out after 5s, forcing exit")
 
         self._system = None
-        if self._root:
-            self._root.destroy()
-
-    # ── Phase 4: 成功 + 重開機提示 ──
-
-    def _show_reboot_prompt(self, added_gb: float, rand_mbs: float, warning: str):
-        """Registry pagefile 註冊成功，提示重開機"""
-        self._clear()
-        self._phase = "done"
-
-        # 調整視窗大小
-        self._root.geometry(f"360x300+{self._root.winfo_x()}+{self._root.winfo_y()}")
-
-        tk.Label(self._frame, text="VRAM Booster", font=("Segoe UI", 14, "bold"),
-                 fg=self.ACCENT, bg=self.BG).pack(pady=(20, 8))
-
-        # 成功訊息
-        tk.Label(self._frame, text="Pagefile registered!", font=("Segoe UI", 12, "bold"),
-                 fg=self.GREEN, bg=self.BG).pack(pady=(0, 10))
-
-        # 資訊卡
-        card = tk.Frame(self._frame, bg=self.BG2, padx=15, pady=10)
-        card.pack(fill="x", padx=15, pady=5)
-
-        rows = [
-            ("Swap", f"+{added_gb:.1f} GB", self.GREEN),
-            ("Speed", f"{rand_mbs:.0f} MB/s (random write)", self.FG),
-            ("Drive", f"{self._my_drive}:\\", self.FG),
-        ]
-        if warning:
-            rows.append(("Note", warning, self.ORANGE))
-
-        for lbl, val, fg in rows:
-            r = tk.Frame(card, bg=self.BG2)
-            r.pack(fill="x", pady=1)
-            tk.Label(r, text=f"{lbl}:", font=("Segoe UI", 9),
-                     fg=self.GRAY, bg=self.BG2, width=6, anchor="e").pack(side="left")
-            tk.Label(r, text=val, font=("Segoe UI", 9, "bold"),
-                     fg=fg, bg=self.BG2, anchor="w").pack(side="left", padx=(8, 0))
-
-        # 重開機提示
-        tk.Label(self._frame,
-                 text="Reboot to activate pagefile",
-                 font=("Segoe UI", 10), fg=self.ORANGE, bg=self.BG).pack(pady=(12, 8))
-
-        # 按鈕
-        btn_f = tk.Frame(self._frame, bg=self.BG)
-        btn_f.pack(pady=5)
-        tk.Button(btn_f, text=" Reboot Now ", font=("Segoe UI", 10, "bold"),
-                  fg="white", bg="#00c853", activebackground=self.GREEN,
-                  relief="flat", cursor="hand2", padx=16, pady=4,
-                  command=self._reboot).pack(side="left", padx=8)
-        tk.Button(btn_f, text=" Later ", font=("Segoe UI", 10),
-                  fg=self.GRAY, bg="#333333", activebackground="#444444",
-                  relief="flat", cursor="hand2", padx=16, pady=4,
-                  command=self._quit).pack(side="left", padx=8)
-
-    def _reboot(self):
-        """觸發 Windows/Linux 重開機"""
-        self._running = False
-        try:
-            if platform.system().lower() == "windows":
-                _run_hidden(["shutdown", "/r", "/t", "5", "/c", "VRAM Booster: activating pagefile"])
-            else:
-                _run_hidden(["shutdown", "-r", "+0"])
-        except OSError as e:
-            logger.error("Reboot failed: %s", e)
         if self._root:
             self._root.destroy()
 
