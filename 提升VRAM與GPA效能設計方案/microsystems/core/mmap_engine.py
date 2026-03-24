@@ -45,7 +45,7 @@ class MmapSwapEngine:
         self._block_size: int = DEFAULT_BLOCK_SIZE
 
         # Callbacks
-        self._on_progress: Optional[Callable[[float], None]] = None
+        self._on_progress: Optional[Callable[[str], None]] = None
         self._on_state_change: Optional[Callable[[str], None]] = None
 
         # Circuit breaker for device health
@@ -69,7 +69,7 @@ class MmapSwapEngine:
         device_path: str,
         size_bytes: int,
         block_size: int = DEFAULT_BLOCK_SIZE,
-        on_progress: Optional[Callable[[float], None]] = None,
+        on_progress: Optional[Callable[[str], None]] = None,
         on_state_change: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """Create + open swap, start monitoring.
@@ -87,8 +87,9 @@ class MmapSwapEngine:
             self._swap = SwapFileManager(block_size=block_size)
             self._swap.create(swap_path, size_bytes)
 
+            size_mb = size_bytes // (1024 * 1024)
             if on_progress:
-                on_progress(0.5)
+                on_progress(f"creating swap file ({size_mb // 1024}GB)...")
 
             self._swap.open()
 
@@ -97,7 +98,7 @@ class MmapSwapEngine:
                 self._swap.map_block(bid)
 
             if on_progress:
-                on_progress(1.0)
+                on_progress(f"mapped {self._swap.total_blocks} blocks")
 
             self._active = True
             self._degraded = False
