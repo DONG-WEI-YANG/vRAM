@@ -70,6 +70,7 @@ class SwapFileManager:
         self._file_size: int = 0
         self._total_blocks: int = 0
         self._blocks: Dict[int, MappedBlock] = {}
+        self._io_errors: int = 0  # I/O 失敗計數，供 circuit breaker 偵測
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -184,6 +185,7 @@ class SwapFileManager:
             blk.last_access = time.time()
             return data
         except (OSError, ValueError):
+            self._io_errors += 1
             return None
 
     def write_block(self, block_id: int, data: bytes, offset: int = 0) -> bool:
@@ -202,7 +204,15 @@ class SwapFileManager:
             blk.last_access = time.time()
             return True
         except (OSError, ValueError):
+            self._io_errors += 1
             return False
+
+    @property
+    def io_errors(self) -> int:
+        return self._io_errors
+
+    def reset_io_errors(self) -> None:
+        self._io_errors = 0
 
     def is_device_present(self) -> bool:
         """Quick check whether the swap file is still reachable."""

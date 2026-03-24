@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Callable, Dict, Any, Optional
 
 from .circuit_breaker import CircuitBreaker, BreakerConfig, BreakerState
@@ -38,6 +39,7 @@ class MmapSwapEngine:
     """
 
     def __init__(self) -> None:
+        self.uid: str = uuid.uuid4().hex[:8]  # 穩定 ID，不依賴 memory address
         self._swap: Optional[SwapFileManager] = None
         self._active: bool = False
         self._degraded: bool = False
@@ -48,6 +50,9 @@ class MmapSwapEngine:
         self._on_progress: Optional[Callable[[str], None]] = None
         self._on_state_change: Optional[Callable[[str], None]] = None
 
+        # Block-level lock：保護 _on_disconnect/_on_reconnect 與 I/O 路徑的競爭
+        self._block_lock = threading.Lock()
+
         # Circuit breaker for device health
         self._breaker = CircuitBreaker(
             name="device_swap",
@@ -57,6 +62,7 @@ class MmapSwapEngine:
                 success_threshold=1,
             ),
         )
+        self._last_io_errors: int = 0  # 上次檢查時的 I/O error 計數
 
         # Monitor thread
         self._monitor_thread: Optional[threading.Thread] = None
@@ -191,7 +197,7 @@ class MmapSwapEngine:
     # ── Internal ───────────────────────────────────────────────────────
 
     def _monitor_loop(self) -> None:
-        """Background thread that polls device presence."""
+        """Background thread that polls device presence and I/O health."""
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=_MONITOR_INTERVAL)
             if self._stop_event.is_set():
@@ -201,6 +207,17 @@ class MmapSwapEngine:
                 continue
 
             present = self._swap.is_device_present()
+
+            # I/O error 偵測：handle 失效（如 hibernate 後）也會觸發 breaker
+            cur_io_errors = self._swap.io_errors
+            new_errors = cur_io_errors - self._last_io_errors
+            self._last_io_errors = cur_io_errors
+            if new_errors > 0:
+                logger.warning("Detected %d new I/O errors (stale handle?)", new_errors)
+                self._breaker.record_failure(f"{new_errors} I/O errors")
+                if not self._degraded and self._breaker.state == BreakerState.OPEN:
+                    self._on_disconnect()
+                continue
 
             if present:
                 self._breaker.record_success()
@@ -215,16 +232,17 @@ class MmapSwapEngine:
         """Called when the breaker trips due to device loss."""
         logger.warning("Device disconnected -- entering degraded mode")
         leaked = 0
-        if self._swap is not None:
-            for bid in list(self._swap.blocks):
-                blk = self._swap.blocks[bid]
-                if blk.mmap_obj is not None:
-                    try:
-                        blk.mmap_obj.close()
-                    except Exception:
-                        leaked += 1
-                    blk.mmap_obj = None
-                blk.state = "evicted"
+        with self._block_lock:
+            if self._swap is not None:
+                for bid in list(self._swap.blocks):
+                    blk = self._swap.blocks[bid]
+                    if blk.mmap_obj is not None:
+                        try:
+                            blk.mmap_obj.close()
+                        except Exception:
+                            leaked += 1
+                        blk.mmap_obj = None
+                    blk.state = "evicted"
         if leaked:
             logger.warning("Failed to close %d mmap handles (device removed mid-I/O)", leaked)
 
@@ -235,15 +253,19 @@ class MmapSwapEngine:
     def _on_reconnect(self) -> None:
         """Called when the breaker recovers after device reconnection."""
         logger.info("Device reconnected -- restoring blocks")
-        if self._swap is not None:
-            try:
-                self._swap.close()
-                self._swap.open()
-                for bid in range(self._swap.total_blocks):
-                    self._swap.map_block(bid)
-            except Exception as exc:
-                logger.error("Failed to restore blocks: %s", exc)
-                return
+        with self._block_lock:
+            if self._swap is not None:
+                try:
+                    self._swap.close()
+                    self._swap.open()
+                    for bid in range(self._swap.total_blocks):
+                        self._swap.map_block(bid)
+                except Exception as exc:
+                    logger.error("Failed to restore blocks: %s", exc)
+                    return
+                # 恢復後重置 I/O error 計數
+                self._swap.reset_io_errors()
+                self._last_io_errors = 0
 
         self._degraded = False
         if self._on_state_change:
