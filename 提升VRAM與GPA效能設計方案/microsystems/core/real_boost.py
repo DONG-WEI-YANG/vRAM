@@ -94,6 +94,7 @@ class RealBoostEngine:
         self._engine_swap_bytes: Dict[str, int] = {}  # engine.uid → swap bytes
         self._vhd_engine: Optional[VhdPagefileEngine] = None
         self._vhd_active: bool = False
+        self._linux_swap_engine = None  # LinuxSwapEngine instance
         self._state_lock = threading.RLock()  # 保護所有共享狀態
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
@@ -398,6 +399,15 @@ class RealBoostEngine:
             result["vhd_active"] = False
             result["method"] = "mmap_swap" if engines else "none"
             result["system_wide"] = False
+
+        # Linux 多裝置 swap 狀態
+        if getattr(self, '_linux_swap_engine', None):
+            linux_st = self._linux_swap_engine.status()
+            result["linux_swap_active"] = linux_st.get("active", False)
+            result["linux_devices"] = linux_st.get("devices", [])
+            if linux_st.get("active"):
+                result["method"] = "linux_parallel_swap"
+                result["system_wide"] = True
 
         # 多裝置聚合狀態
         if engines:
@@ -973,7 +983,60 @@ class RealBoostEngine:
 
     def _activate_linux(self, mount_point: str, use_pct: float,
                         report=None) -> Dict[str, Any]:
-        """在 Linux 上建立 swap file"""
+        """
+        Linux 多裝置平行 swap：掃描所有外接裝置，各自建立 swap file，
+        用 swapon -p 同優先級實現 round-robin I/O。
+
+        所有程式自動受益（kernel-level swap）。
+        """
+        report = report or (lambda msg: None)
+
+        try:
+            from .linux_swap import LinuxSwapEngine
+        except ImportError as e:
+            logger.warning("LinuxSwapEngine not available: %s", e)
+            return self._activate_linux_single(mount_point, use_pct, report)
+
+        # 掃描所有外接掛載點
+        engine = LinuxSwapEngine()
+        mount_points = engine._scan_mount_points(mount_point)
+        if not mount_points:
+            mount_points = [mount_point]
+        report(f"found {len(mount_points)} mount point(s)")
+
+        # 多裝置平行啟用
+        result = engine.activate(
+            mount_points=mount_points,
+            use_percent=use_pct,
+            on_progress=report,
+        )
+
+        if result.get("success"):
+            self._linux_swap_engine = engine
+            self._active = True
+            self._swap_size_bytes = int(result.get("added_gb", 0) * (1024 ** 3))
+
+            # 記錄系統 swap 狀態
+            self._system_pf_bytes = self._get_system_pagefile_bytes()
+
+            return {
+                "success": True,
+                "method": result.get("method", "linux_parallel_swap"),
+                "system_wide": True,
+                "device_count": result.get("device_count", 0),
+                "devices": result.get("devices", []),
+                "added_gb": result.get("added_gb", 0),
+                "combined_speed_mbs": result.get("combined_speed_mbs", 0),
+                "needs_reboot": False,
+            }
+
+        # Fallback: 單裝置模式
+        logger.warning("Multi-device swap failed, falling back to single device")
+        return self._activate_linux_single(mount_point, use_pct, report)
+
+    def _activate_linux_single(self, mount_point: str, use_pct: float,
+                                report=None) -> Dict[str, Any]:
+        """Fallback: 單一裝置 swap（原始邏輯）"""
         report = report or (lambda msg: None)
         try:
             usage = shutil.disk_usage(mount_point)
@@ -1050,11 +1113,19 @@ class RealBoostEngine:
             return {"success": False, "error": str(e)}
 
     def _deactivate_linux(self) -> Dict[str, Any]:
-        """取消 swap，但保留檔案供下次快速啟動"""
+        """取消所有 swap，保留檔案供下次快速啟動"""
+        # 多裝置引擎清理
+        if self._linux_swap_engine:
+            try:
+                self._linux_swap_engine.deactivate()
+            except Exception as e:
+                logger.warning("Linux swap engine deactivate error: %s", e)
+            self._linux_swap_engine = None
+
+        # 單裝置 fallback 清理
         if self._swap_path:
             try:
                 _run_hidden(["swapoff", str(self._swap_path)], timeout=30)
-                # 保留 swap 檔案在 SD 卡上，下次插入可直接複用
                 logger.info("Swap disabled, file kept for reuse: %s", self._swap_path)
             except (subprocess.TimeoutExpired, OSError) as e:
                 logger.warning("Swapoff error: %s", e)
