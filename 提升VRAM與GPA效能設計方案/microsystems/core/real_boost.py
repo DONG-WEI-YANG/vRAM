@@ -29,6 +29,7 @@ import os
 import platform
 import subprocess
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Callable
@@ -82,6 +83,13 @@ class RealBoostEngine:
         self._device_letter = ""
         self._original_mem: Dict[str, int] = {}
         self._measured_rand_write_mbs: float = 0.0
+        # Multi-device state
+        self._mmap_engines: list = []
+        self._striped: Optional[StripedSwapScheduler] = None
+        self._known_drives: set = set()
+        self._beacon_count: int = 0
+        self._hotdetect_thread: Optional[threading.Thread] = None
+        self._hotdetect_stop = threading.Event()
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
 
@@ -593,10 +601,20 @@ class RealBoostEngine:
 
         self._swap_size_bytes = total_swap_bytes
         self._active = True
+        self._known_drives = set(drv for drv in drives if any(
+            d["drive"] == drv for d in device_details))
 
         # ── OS 辨識：在 C:\ 建立動態 pagefile（小檔案大上限） ──
-        # min=16MB 幾乎不佔空間，max=swap容量 讓 OS 認知增加
         os_visible = self._create_os_beacon(total_swap_bytes, report)
+        self._beacon_count = 1 if os_visible else 0
+
+        # ── 背景熱偵測：每 30 秒掃描新裝置 ──
+        self._hotdetect_stop.clear()
+        self._hotdetect_thread = threading.Thread(
+            target=self._hot_detect_loop, daemon=True,
+            name="hotplug-detect")
+        self._hotdetect_thread.start()
+        report("hot-detect started (30s interval)")
 
         after_mem = self.get_system_memory()
         total_gb = total_swap_bytes / (1024 ** 3)
@@ -614,6 +632,151 @@ class RealBoostEngine:
             "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             "needs_reboot": False,
         }
+
+    # ── Hot-Detect: 背景偵測新裝置 ──
+
+    def _hot_detect_loop(self):
+        """每 30 秒掃描新裝置，自動加入 striped group。"""
+        while not self._hotdetect_stop.wait(timeout=30):
+            if not self._active:
+                break
+            try:
+                self._hot_detect_scan()
+            except Exception as e:
+                logger.debug("Hot-detect error: %s", e)
+
+    def _hot_detect_scan(self):
+        """掃描是否有新裝置可加入。"""
+        current = self._scan_external_drives(self._device_letter)
+        new_drives = [d for d in current if d not in self._known_drives]
+
+        if not new_drives:
+            return
+
+        for drv in new_drives:
+            mount = f"{drv}:\\"
+            try:
+                usage = shutil.disk_usage(mount)
+            except OSError:
+                continue
+            if usage.free < 512 * (1024 ** 2):
+                continue
+
+            logger.info("Hot-detect: new device %s:", drv)
+
+            # 測速
+            cached = self._load_cached_config(mount)
+            cached_speed = cached.get("effective_speed_mbs", 0) if cached else 0
+            speed = self._benchmark_random_write(mount, test_size_mb=4)
+            seq_speed = self._benchmark_sequential_write(mount)
+            measured = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
+            effective_speed = max(measured, cached_speed)
+
+            self._save_config(mount, {
+                "rand_write_mbs": speed,
+                "seq_write_mbs": seq_speed,
+                "effective_speed_mbs": effective_speed,
+                "drive_letter": drv,
+            })
+
+            # Per-device cap
+            STRIPED_MULTIPLIER = 2.0
+            device_cap = int(effective_speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS * STRIPED_MULTIPLIER)
+            device_cap = max(device_cap, SWAP_MIN_BYTES)
+            wanted = min(int(usage.free * 0.8), device_cap)
+            swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
+
+            if swap_bytes < 512 * (1024 ** 2):
+                continue
+
+            # 建立 mmap swap
+            engine = MmapSwapEngine()
+            result = engine.activate(device_path=mount, size_bytes=swap_bytes)
+
+            if result.get("success"):
+                self._mmap_engines.append(engine)
+                self._swap_size_bytes += swap_bytes
+                self._known_drives.add(drv)
+
+                if self._striped:
+                    self._striped.add_device(engine, effective_speed)
+
+                # 額外 OS beacon
+                self._beacon_count += 1
+                beacon_name = f"C:\\vram_boost_{self._beacon_count}.sys"
+                self._create_os_beacon_named(beacon_name, swap_bytes)
+
+                swap_gb = swap_bytes / (1024 ** 3)
+                logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
+
+    def _create_os_beacon_named(self, pf_path: str, size_bytes: int) -> bool:
+        """建立具名 OS beacon（用於熱插入的額外裝置）。"""
+        import ctypes
+        import ctypes.wintypes
+
+        BEACON_MIN = 16 * 1024 * 1024
+
+        if os.path.exists(pf_path):
+            try:
+                with open(pf_path, "r+b"):
+                    pass
+                os.unlink(pf_path)
+            except (PermissionError, OSError):
+                return True  # already active
+
+        try:
+            # 啟用 privilege（可能已啟用）
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+            advapi32.OpenProcessToken.argtypes = [
+                ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                ctypes.POINTER(ctypes.wintypes.HANDLE)]
+            advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
+
+            class LUID(ctypes.Structure):
+                _fields_ = [("LowPart", ctypes.wintypes.DWORD), ("HighPart", ctypes.c_long)]
+            class LUID_AND_ATTRIBUTES(ctypes.Structure):
+                _fields_ = [("Luid", LUID), ("Attributes", ctypes.wintypes.DWORD)]
+            class TOKEN_PRIVILEGES(ctypes.Structure):
+                _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
+                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+            hToken = ctypes.wintypes.HANDLE()
+            advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
+            luid = LUID()
+            advapi32.LookupPrivilegeValueW(None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
+            tp = TOKEN_PRIVILEGES(); tp.PrivilegeCount = 1
+            tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = 0x00000002
+            advapi32.AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), 0, None, None)
+            kernel32.CloseHandle(hToken)
+
+            class UNICODE_STRING(ctypes.Structure):
+                _fields_ = [('Length', ctypes.c_ushort), ('MaximumLength', ctypes.c_ushort),
+                             ('Buffer', ctypes.c_wchar_p)]
+            class LARGE_INTEGER(ctypes.Structure):
+                _fields_ = [('QuadPart', ctypes.c_longlong)]
+
+            ntdll = ctypes.WinDLL('ntdll')
+            fn = ntdll.NtCreatePagingFile
+            fn.restype = ctypes.c_long
+            fn.argtypes = [ctypes.POINTER(UNICODE_STRING), ctypes.POINTER(LARGE_INTEGER),
+                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
+
+            nt_path = f"\\??\\{pf_path}"
+            upath = UNICODE_STRING()
+            upath.Buffer = nt_path; upath.Length = len(nt_path) * 2
+            upath.MaximumLength = (len(nt_path) + 1) * 2
+            min_s = LARGE_INTEGER(); min_s.QuadPart = BEACON_MIN
+            max_s = LARGE_INTEGER(); max_s.QuadPart = size_bytes
+
+            status = fn(ctypes.byref(upath), ctypes.byref(min_s), ctypes.byref(max_s), 0)
+            if status == 0:
+                logger.info("OS beacon created: %s (max=%dMB)", pf_path, size_bytes // (1024**2))
+                return True
+            return False
+        except (OSError, AttributeError):
+            return False
 
     @staticmethod
     def _create_os_beacon(swap_size_bytes: int, report) -> bool:
@@ -757,7 +920,13 @@ class RealBoostEngine:
                 pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉所有裝置的 mmap swap + striped scheduler。"""
+        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect。"""
+        # 停止熱偵測
+        self._hotdetect_stop.set()
+        if self._hotdetect_thread and self._hotdetect_thread.is_alive():
+            self._hotdetect_thread.join(timeout=5)
+        self._hotdetect_thread = None
+
         if hasattr(self, '_striped') and self._striped:
             self._striped.close()
             self._striped = None
@@ -767,6 +936,7 @@ class RealBoostEngine:
             except (OSError, Exception) as e:
                 logger.warning("Deactivate error: %s", e)
         self._mmap_engines = []
+        self._known_drives = set()
         # Legacy single-engine cleanup
         if hasattr(self, '_mmap_engine') and self._mmap_engine:
             self._mmap_engine.deactivate()
