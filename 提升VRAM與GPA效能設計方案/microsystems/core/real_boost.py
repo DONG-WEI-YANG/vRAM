@@ -87,14 +87,11 @@ class RealBoostEngine:
         self._mmap_engines: list = []
         self._striped: Optional[StripedSwapScheduler] = None
         self._known_drives: set = set()
-        self._beacon_count: int = 0
-        self._beacon_paths: list = []       # 追蹤所有 beacon 路徑
-        self._beacon_total_bytes: int = 0   # beacon 回報的總量
+        self._system_pf_bytes: int = 0  # 啟動時的 Windows pagefile 大小
         self._hotdetect_thread: Optional[threading.Thread] = None
         self._hotdetect_stop = threading.Event()
         self._engine_swap_bytes: Dict[str, int] = {}  # engine.uid → swap bytes
         self._state_lock = threading.RLock()  # 保護所有共享狀態
-        self._pid = os.getpid()  # beacon 命名用，防多實例衝突
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
 
@@ -355,7 +352,7 @@ class RealBoostEngine:
             return self._deactivate_linux()
 
     def status(self) -> Dict[str, Any]:
-        """取得真實的系統記憶體狀態（含 beacon 誠信檢查）"""
+        """取得真實的系統記憶體狀態"""
         mem = self.get_system_memory()
 
         # 計算真實可用的外接 swap（只算連線中的裝置）
@@ -381,12 +378,11 @@ class RealBoostEngine:
             "total_usable_gb": (mem.get("physical_total", 0) + real_swap_bytes) / (1024 ** 3),
         }
 
-        # beacon 誠信：回報 beacon 是否與真實可用量一致
-        beacon_bytes = getattr(self, '_beacon_total_bytes', 0)
-        if beacon_bytes > 0 and real_swap_bytes < beacon_bytes:
-            result["beacon_stale"] = True
-            result["beacon_reported_gb"] = beacon_bytes / (1024 ** 3)
-            result["beacon_overreport_gb"] = (beacon_bytes - real_swap_bytes) / (1024 ** 3)
+        # Windows pagefile 資訊：讓呼叫者知道系統已有的 swap
+        sys_pf = getattr(self, '_system_pf_bytes', 0)
+        if sys_pf > 0:
+            result["system_pagefile_gb"] = sys_pf / (1024 ** 3)
+            result["total_with_system_gb"] = (mem.get("physical_total", 0) + sys_pf + real_swap_bytes) / (1024 ** 3)
 
         # 多裝置聚合狀態
         if engines:
@@ -628,13 +624,14 @@ class RealBoostEngine:
         self._known_drives = set(drv for drv in drives if any(
             d["drive"] == drv for d in device_details))
 
-        # ── OS 辨識：在 C:\ 建立動態 pagefile（小檔案大上限） ──
-        beacon_path = f"C:\\vram_boost_{self._pid}.sys"
-        os_visible = self._create_os_beacon(total_swap_bytes, report, beacon_path)
-        with self._state_lock:
-            self._beacon_count = 1 if os_visible else 0
-            self._beacon_paths = [beacon_path] if os_visible else []
-            self._beacon_total_bytes = total_swap_bytes if os_visible else 0
+        # ── 評估 Windows pagefile 是否足夠 ──
+        self._system_pf_bytes = self._get_system_pagefile_bytes()
+        pf_gb = self._system_pf_bytes / (1024**3)
+        ram_gb = self._original_mem.get("physical_total", 0) / (1024**3)
+        if self._system_pf_bytes > 0:
+            report(f"Windows pagefile: {pf_gb:.0f}GB (auto), our mmap: +{total_swap_bytes/(1024**3):.1f}GB on external")
+        else:
+            report(f"No Windows pagefile detected, external swap is primary expansion")
 
         # ── 背景熱偵測：每 30 秒掃描新裝置 ──
         self._hotdetect_stop.clear()
@@ -650,7 +647,7 @@ class RealBoostEngine:
         return {
             "success": True,
             "method": "striped_mmap_swap" if len(self._mmap_engines) > 1 else "mmap_swap",
-            "os_visible": os_visible,
+            "system_pagefile_gb": round(self._system_pf_bytes / (1024**3), 1),
             "device_count": len(self._mmap_engines),
             "devices": device_details,
             "added_gb": round(total_gb, 1),
@@ -734,17 +731,10 @@ class RealBoostEngine:
                     if self._striped:
                         self._striped.add_device(engine, effective_speed)
 
-                    # 額外 OS beacon（PID 隔離，不影響其他實例）
-                    self._beacon_count += 1
-                    beacon_name = f"C:\\vram_boost_{self._pid}_{self._beacon_count}.sys"
-                    if self._create_os_beacon_named(beacon_name, swap_bytes):
-                        self._beacon_paths.append(beacon_name)
-                        self._beacon_total_bytes += swap_bytes
-
                 swap_gb = swap_bytes / (1024 ** 3)
                 logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
 
-    # ── 裝置狀態變化 → 動態調整 beacon ──
+    # ── 裝置狀態變化 ──
 
     def _on_device_state_changed(self, drive_letter: str, state: str) -> None:
         """
@@ -766,8 +756,6 @@ class RealBoostEngine:
                 logger.info("Device %s: disconnected — lost %.1fGB, remaining %.1fGB",
                             drive_letter, lost_bytes / (1024**3), alive_bytes / (1024**3))
 
-                self._adjust_beacon(alive_bytes)
-
             elif state == "restored":
                 # 裝置恢復：重新計算全量
                 total_bytes = sum(
@@ -776,270 +764,35 @@ class RealBoostEngine:
                     if not eng.status().get("degraded", False)
                 )
                 logger.info("Device %s: restored — total %.1fGB", drive_letter, total_bytes / (1024**3))
-                self._adjust_beacon(total_bytes)
 
-    def _adjust_beacon(self, target_bytes: int) -> None:
-        """
-        嘗試調整 OS beacon 大小以反映真實可用的外接 swap。
-
-        Windows 限制：NtCreatePagingFile 無法縮小已建立的 pagefile。
-        策略：嘗試用 min=max=16MB 重建，讓 OS 不再把它當大 pagefile。
-        如果失敗（預期中），標記 beacon 為 stale，status() 會誠實回報。
-        """
-        if not self._is_windows or not self._beacon_paths:
-            return
-
-        if target_bytes >= self._beacon_total_bytes:
-            # 不需要縮 — 恢復或持平
-            return
-
-        BEACON_MIN = 16 * 1024 * 1024
-
-        # 嘗試對每個 beacon pagefile 用新的 max 重建
-        # NtCreatePagingFile 對已 active 的 pagefile 預期會失敗，
-        # 但如果 OS 允許 resize 那就直接成功
+    @staticmethod
+    def _get_system_pagefile_bytes() -> int:
+        """取得 Windows 系統 pagefile 大小（不含物理 RAM）。"""
+        if platform.system().lower() != "windows":
+            return 0
         try:
             import ctypes
             import ctypes.wintypes
 
-            class UNICODE_STRING(ctypes.Structure):
-                _fields_ = [('Length', ctypes.c_ushort),
-                             ('MaximumLength', ctypes.c_ushort),
-                             ('Buffer', ctypes.c_wchar_p)]
-            class LARGE_INTEGER(ctypes.Structure):
-                _fields_ = [('QuadPart', ctypes.c_longlong)]
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.wintypes.DWORD),
+                    ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
 
-            ntdll = ctypes.WinDLL('ntdll')
-            fn = ntdll.NtCreatePagingFile
-            fn.restype = ctypes.c_long
-            fn.argtypes = [ctypes.POINTER(UNICODE_STRING),
-                           ctypes.POINTER(LARGE_INTEGER),
-                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
-
-            # 算出每個 beacon 應該分到多少（等比縮小）
-            n_beacons = len(self._beacon_paths)
-            per_beacon = max(BEACON_MIN, target_bytes // n_beacons) if n_beacons else 0
-
-            adjusted = False
-            for pf_path in self._beacon_paths:
-                nt_path = f"\\??\\{pf_path}"
-                upath = UNICODE_STRING()
-                upath.Buffer = nt_path
-                upath.Length = len(nt_path) * 2
-                upath.MaximumLength = (len(nt_path) + 1) * 2
-
-                min_s = LARGE_INTEGER()
-                min_s.QuadPart = BEACON_MIN
-                max_s = LARGE_INTEGER()
-                max_s.QuadPart = per_beacon if target_bytes > 0 else BEACON_MIN
-
-                status = fn(ctypes.byref(upath), ctypes.byref(min_s),
-                            ctypes.byref(max_s), 0)
-                if status == 0:
-                    logger.info("Beacon %s resized to %dMB", pf_path, per_beacon // (1024**2))
-                    adjusted = True
-                else:
-                    logger.warning("Beacon %s resize failed (0x%08X) — stale until restart",
-                                   pf_path, status & 0xFFFFFFFF)
-
-            if adjusted:
-                self._beacon_total_bytes = target_bytes
-            else:
-                # 無法縮小：誠實記錄，status() 會回報差異
-                logger.warning(
-                    "Cannot shrink beacon at runtime (Windows limitation). "
-                    "Beacon reports %.1fGB but real available is %.1fGB. "
-                    "Will correct on next activation.",
-                    self._beacon_total_bytes / (1024**3),
-                    target_bytes / (1024**3),
-                )
-
-        except (OSError, AttributeError) as e:
-            logger.warning("Beacon adjustment failed: %s", e)
-
-    def _create_os_beacon_named(self, pf_path: str, size_bytes: int) -> bool:
-        """建立具名 OS beacon（用於熱插入的額外裝置）。"""
-        import ctypes
-        import ctypes.wintypes
-
-        BEACON_MIN = 16 * 1024 * 1024
-
-        if os.path.exists(pf_path):
-            try:
-                with open(pf_path, "r+b"):
-                    pass
-                os.unlink(pf_path)
-            except (PermissionError, OSError):
-                return True  # already active
-
-        try:
-            # 啟用 privilege（可能已啟用）
-            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-            advapi32.OpenProcessToken.argtypes = [
-                ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
-                ctypes.POINTER(ctypes.wintypes.HANDLE)]
-            advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
-
-            class LUID(ctypes.Structure):
-                _fields_ = [("LowPart", ctypes.wintypes.DWORD), ("HighPart", ctypes.c_long)]
-            class LUID_AND_ATTRIBUTES(ctypes.Structure):
-                _fields_ = [("Luid", LUID), ("Attributes", ctypes.wintypes.DWORD)]
-            class TOKEN_PRIVILEGES(ctypes.Structure):
-                _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
-                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
-
-            hToken = ctypes.wintypes.HANDLE()
-            advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
-            luid = LUID()
-            advapi32.LookupPrivilegeValueW(None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
-            tp = TOKEN_PRIVILEGES(); tp.PrivilegeCount = 1
-            tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = 0x00000002
-            advapi32.AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), 0, None, None)
-            kernel32.CloseHandle(hToken)
-
-            class UNICODE_STRING(ctypes.Structure):
-                _fields_ = [('Length', ctypes.c_ushort), ('MaximumLength', ctypes.c_ushort),
-                             ('Buffer', ctypes.c_wchar_p)]
-            class LARGE_INTEGER(ctypes.Structure):
-                _fields_ = [('QuadPart', ctypes.c_longlong)]
-
-            ntdll = ctypes.WinDLL('ntdll')
-            fn = ntdll.NtCreatePagingFile
-            fn.restype = ctypes.c_long
-            fn.argtypes = [ctypes.POINTER(UNICODE_STRING), ctypes.POINTER(LARGE_INTEGER),
-                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
-
-            nt_path = f"\\??\\{pf_path}"
-            upath = UNICODE_STRING()
-            upath.Buffer = nt_path; upath.Length = len(nt_path) * 2
-            upath.MaximumLength = (len(nt_path) + 1) * 2
-            min_s = LARGE_INTEGER(); min_s.QuadPart = BEACON_MIN
-            max_s = LARGE_INTEGER(); max_s.QuadPart = size_bytes
-
-            status = fn(ctypes.byref(upath), ctypes.byref(min_s), ctypes.byref(max_s), 0)
-            if status == 0:
-                logger.info("OS beacon created: %s (max=%dMB)", pf_path, size_bytes // (1024**2))
-                return True
-            return False
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return max(0, stat.ullTotalPageFile - stat.ullTotalPhys)
         except (OSError, AttributeError):
-            return False
-
-    @staticmethod
-    def _create_os_beacon(swap_size_bytes: int, report, beacon_path: str = None) -> bool:
-        """
-        在 C:\\ 建立動態 pagefile — 讓 OS 辨識資源增加。
-
-        min=16MB（幾乎不佔空間），max=min(swap_size, C:\\ 可用空間 50%)。
-        防止 OS 在記憶體壓力下把 C:\\ 灌滿。
-        """
-        import ctypes
-        import ctypes.wintypes
-        import shutil
-
-        pf_path = beacon_path or "C:\\vram_boost.sys"
-        BEACON_MIN = 16 * 1024 * 1024  # 16MB — 最小佔用
-
-        # 防止 C:\ 被灌爆：beacon max 不超過 C:\ 可用空間的 50%
-        try:
-            c_free = shutil.disk_usage("C:\\").free
-            safe_max = int(c_free * 0.5)
-            if swap_size_bytes > safe_max:
-                logger.info("Beacon max capped: %.1fGB → %.1fGB (C:\\ 50%% limit)",
-                            swap_size_bytes / (1024**3), safe_max / (1024**3))
-                swap_size_bytes = max(safe_max, BEACON_MIN)
-        except OSError:
-            pass
-
-        # 已 active → 跳過
-        if os.path.exists(pf_path):
-            try:
-                with open(pf_path, "r+b"):
-                    pass
-                os.unlink(pf_path)
-            except (PermissionError, OSError):
-                report("OS beacon already active")
-                return True
-
-        # 啟用 SeCreatePagefilePrivilege
-        try:
-            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-            advapi32.OpenProcessToken.argtypes = [
-                ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
-                ctypes.POINTER(ctypes.wintypes.HANDLE)]
-            advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
-
-            class LUID(ctypes.Structure):
-                _fields_ = [("LowPart", ctypes.wintypes.DWORD),
-                             ("HighPart", ctypes.c_long)]
-            class LUID_AND_ATTRIBUTES(ctypes.Structure):
-                _fields_ = [("Luid", LUID), ("Attributes", ctypes.wintypes.DWORD)]
-            class TOKEN_PRIVILEGES(ctypes.Structure):
-                _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
-                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
-
-            hToken = ctypes.wintypes.HANDLE()
-            advapi32.OpenProcessToken(
-                kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
-            luid = LUID()
-            advapi32.LookupPrivilegeValueW(
-                None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
-            tp = TOKEN_PRIVILEGES()
-            tp.PrivilegeCount = 1
-            tp.Privileges[0].Luid = luid
-            tp.Privileges[0].Attributes = 0x00000002
-            advapi32.AdjustTokenPrivileges(
-                hToken, False, ctypes.byref(tp), 0, None, None)
-            kernel32.CloseHandle(hToken)
-        except (OSError, AttributeError):
-            pass
-
-        # NtCreatePagingFile(min=16MB, max=swap_size)
-        try:
-            class UNICODE_STRING(ctypes.Structure):
-                _fields_ = [('Length', ctypes.c_ushort),
-                             ('MaximumLength', ctypes.c_ushort),
-                             ('Buffer', ctypes.c_wchar_p)]
-            class LARGE_INTEGER(ctypes.Structure):
-                _fields_ = [('QuadPart', ctypes.c_longlong)]
-
-            ntdll = ctypes.WinDLL('ntdll')
-            fn = ntdll.NtCreatePagingFile
-            fn.restype = ctypes.c_long
-            fn.argtypes = [ctypes.POINTER(UNICODE_STRING),
-                           ctypes.POINTER(LARGE_INTEGER),
-                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
-
-            nt_path = f"\\??\\{pf_path}"
-            upath = UNICODE_STRING()
-            upath.Buffer = nt_path
-            upath.Length = len(nt_path) * 2
-            upath.MaximumLength = (len(nt_path) + 1) * 2
-
-            # 關鍵：min ≠ max → 動態 pagefile
-            min_s = LARGE_INTEGER()
-            min_s.QuadPart = BEACON_MIN  # 16MB 初始
-            max_s = LARGE_INTEGER()
-            max_s.QuadPart = swap_size_bytes  # 全量上限
-
-            status = fn(ctypes.byref(upath), ctypes.byref(min_s),
-                         ctypes.byref(max_s), 0)
-
-            if status == 0:
-                report(f"OS beacon: +{swap_size_bytes/(1024**3):.1f}GB visible (16MB on disk)")
-                logger.info("OS beacon created: min=16MB max=%dMB",
-                            swap_size_bytes // (1024**2))
-                return True
-
-            logger.warning("OS beacon failed: 0x%08X", status & 0xFFFFFFFF)
-            return False
-
-        except (OSError, AttributeError) as e:
-            logger.warning("OS beacon failed: %s", e)
-            return False
+            return 0
 
     @staticmethod
     def _benchmark_sequential_write(mount_path: str, size_mb: int = 8) -> float:
@@ -1079,7 +832,7 @@ class RealBoostEngine:
                 pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect + beacon 清理。"""
+        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect。"""
         # 停止熱偵測（SD 卡 I/O 可能卡 30s+，給足夠時間）
         self._hotdetect_stop.set()
         if self._hotdetect_thread and self._hotdetect_thread.is_alive():
@@ -1104,21 +857,7 @@ class RealBoostEngine:
             self._mmap_engine.deactivate()
             self._mmap_engine = None
 
-        # ── 清理 beacon pagefile ──
-        # Runtime 無法刪除 active pagefile（OS 鎖住），
-        # 但 deactivate 後嘗試歸零 + 刪除，至少下次啟動不會殘留。
-        self._adjust_beacon(0)
-        for pf_path in getattr(self, '_beacon_paths', []):
-            try:
-                if os.path.exists(pf_path):
-                    os.unlink(pf_path)
-                    logger.info("Beacon file removed: %s", pf_path)
-            except (PermissionError, OSError):
-                # pagefile 仍被 OS 鎖住 — 正常，重開機後自動消失
-                logger.info("Beacon %s locked by OS, will clean on reboot", pf_path)
-        self._beacon_paths = []
-        self._beacon_total_bytes = 0
-        self._beacon_count = 0
+        self._system_pf_bytes = 0
 
         self._active = False
         self._swap_path = None
