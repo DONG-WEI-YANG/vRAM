@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Callable
 
+from .mmap_engine import MmapSwapEngine
+
 logger = logging.getLogger(__name__)
 
 # Windows: 隱藏子程序視窗
@@ -341,7 +343,7 @@ class RealBoostEngine:
     def status(self) -> Dict[str, Any]:
         """取得真實的系統記憶體狀態"""
         mem = self.get_system_memory()
-        return {
+        result = {
             "active": self._active,
             "swap_path": str(self._swap_path) if self._swap_path else None,
             "swap_size_gb": self._swap_size_bytes / (1024 ** 3),
@@ -351,6 +353,13 @@ class RealBoostEngine:
             "swap_used_gb": mem.get("swap_used", 0) / (1024 ** 3),
             "total_usable_gb": (mem.get("physical_total", 0) + mem.get("swap_total", 0)) / (1024 ** 3),
         }
+        if hasattr(self, '_mmap_engine') and self._mmap_engine:
+            mmap_st = self._mmap_engine.status()
+            result["device_state"] = mmap_st.get("device_state", "unknown")
+            result["degraded"] = mmap_st.get("degraded", False)
+            result["mapped_blocks"] = mmap_st.get("mapped_blocks", 0)
+            result["evicted_blocks"] = mmap_st.get("evicted_blocks", 0)
+        return result
 
     @staticmethod
     def get_system_memory() -> Dict[str, int]:
@@ -442,188 +451,98 @@ class RealBoostEngine:
         cls._gpu_cache_ts = now
         return info
 
-    # ── Windows: Pagefile ──
+    # ── Windows: mmap swap ──
+
+    @staticmethod
+    def _cleanup_old_pagefile_registry():
+        """Remove stale vram_boost registry entries from old NtCreatePagingFile approach."""
+        if platform.system().lower() != "windows":
+            return
+        try:
+            _run_hidden(["powershell", "-NoProfile", "-Command",
+                "$ErrorActionPreference='SilentlyContinue';"
+                "$rp='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management';"
+                "$c=(Get-ItemProperty $rp -Name PagingFiles).PagingFiles;"
+                "if($c -is [string]){$c=@($c)};"
+                "$f=$c|Where-Object{$_ -and $_.ToLower() -notlike '*vram_boost*'};"
+                "if(-not $f){$f=@()};"
+                "if($f.Count -ne $c.Count){Set-ItemProperty $rp -Name PagingFiles -Value $f}"],
+                timeout=15)
+        except Exception:
+            pass
 
     def _activate_windows(self, letter: str, use_pct: float,
                           report=None) -> Dict[str, Any]:
-        """在 Windows 上建立 pagefile"""
+        """
+        在 Windows 上透過 MmapSwapEngine 建立 mmap-backed swap。
+
+        swap 大小依然由裝置速度公式決定（確保 I/O 不凍結）。
+        """
         report = report or (lambda msg: None)
+
+        # One-time cleanup of stale registry entries from old NtCreatePagingFile approach
+        self._cleanup_old_pagefile_registry()
+
         mount = f"{letter}:\\"
         try:
             usage = shutil.disk_usage(mount)
         except OSError as e:
             return {"success": False, "error": f"Cannot access {mount}: {e}"}
 
-        swap_path_str = f"{letter}:\\{self.SWAP_FILENAME}"
-        swap_path = Path(swap_path_str)
-
-        # 先算出速度公式的上限
+        # 計算 swap 大小（受裝置速度上限約束）
         wanted_bytes = int(usage.free * (use_pct / 100))
         wanted_bytes, speed_warning_msg = self._cap_swap_by_speed(wanted_bytes)
-
-        # 檢查上次的 swap 檔案是否可複用
-        reuse = False
-        if swap_path.exists() and self._verify_swap_file(swap_path):
-            existing_size = swap_path.stat().st_size
-            # 舊檔案大小在合理範圍內才複用（不超過上限的 1.5 倍）
-            if existing_size <= wanted_bytes * 1.5:
-                swap_bytes = existing_size
-                reuse = True
-                report(f"swap ({existing_size // (1024**3)}GB) reuse OK")
-            else:
-                # 舊 swap 太大（可能是修復前建的），刪掉重建
-                report(f"swap too large ({existing_size // (1024**3)}GB > {wanted_bytes // (1024**3)}GB limit), rebuilding...")
-                try:
-                    swap_path.unlink()
-                except OSError:
-                    pass
-
-        if not reuse:
-            swap_bytes = wanted_bytes
-
-        swap_mb = swap_bytes // (1024 * 1024)
+        swap_mb = wanted_bytes // (1024 * 1024)
 
         if swap_mb < 512:
             return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
 
-        if not reuse:
-            report(f"building pagefile ({swap_mb // 1024}GB)...")
+        swap_bytes = swap_mb * 1024 * 1024  # 對齊到 MB
 
-        try:
-            # 嘗試多種方法建立 pagefile（按可靠度排序）
-            ok, err_detail = self._register_pagefile_windows(swap_path_str, swap_mb)
+        report(f"activating mmap swap ({swap_mb // 1024}GB)...")
 
-            if not ok:
-                return {
-                    "success": False,
-                    "error": err_detail,
-                    "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
-                }
-
-            self._swap_path = swap_path
-            self._swap_size_bytes = swap_bytes
-            self._active = True
-
-            after_mem = self.get_system_memory()
-            added_gb = swap_bytes / (1024 ** 3)
-
-            method = "pagefile_reuse" if reuse else "pagefile"
-            logger.info("Windows pagefile %s: %s (%.1fGB)",
-                        "reused" if reuse else "created", swap_path_str, added_gb)
-
-            result = {
-                "success": True,
-                "method": method,
-                "reused": reuse,
-                "swap_path": swap_path_str,
-                "added_gb": round(added_gb, 1),
-                "total_usable_gb": round(after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
-                "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
-            }
-            if speed_warning_msg:
-                result["warning"] = speed_warning_msg
-            return result
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    @staticmethod
-    def _register_pagefile_windows(swap_path: str, size_mb: int) -> Tuple[bool, str]:
-        """
-        在 Windows 上建立 pagefile。
-
-        Windows 11 的 CIM/WMI provider 不支援 New-CimInstance 建立 pagefile。
-        最可靠的方法是直接操作 registry：
-          HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management
-            - PagingFiles (REG_MULTI_SZ): 每行一個 pagefile
-            - 格式: "路徑 初始MB 最大MB"
-        同時關閉 AutomaticManagedPagefile。
-        """
-        # Registry 路徑
-        reg_key = r"HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-        entry = f"{swap_path} {size_mb} {size_mb}"
-
-        ps_script = (
-            "$ErrorActionPreference = 'Stop'; "
-            # Step 1: 關閉自動管理
-            "$sys = Get-CimInstance Win32_ComputerSystem; "
-            "if ($sys.AutomaticManagedPagefile) { "
-            "  Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$false}; "
-            "  Write-Host 'AutoManaged OFF' "
-            "}; "
-            # Step 2: 讀取現有 pagefile 設定
-            f"$regPath = '{reg_key}'; "
-            "$current = (Get-ItemProperty $regPath -Name PagingFiles).PagingFiles; "
-            # Step 3: 檢查是否已包含此路徑
-            f"$newEntry = '{entry}'; "
-            f"$targetDrive = '{swap_path[0]}'; "
-            "$already = $false; "
-            "foreach ($pf in $current) { "
-            "  if ($pf -and $pf[0] -eq $targetDrive) { $already = $true; break } "
-            "}; "
-            "if ($already) { "
-            "  Write-Host 'Already registered'; exit 0 "
-            "}; "
-            # Step 4: 加入新 pagefile
-            "if ($current -is [string]) { $current = @($current) }; "
-            "$updated = $current + $newEntry; "
-            "Set-ItemProperty $regPath -Name PagingFiles -Value $updated; "
-            "Write-Host 'Pagefile registered via registry'"
+        self._mmap_engine = MmapSwapEngine()
+        mmap_result = self._mmap_engine.activate(
+            device_path=mount,
+            size_bytes=swap_bytes,
+            on_progress=report,
         )
 
-        try:
-            r = _run_hidden(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                timeout=30,
-            )
+        if not mmap_result.get("success"):
+            return {
+                "success": False,
+                "error": mmap_result.get("error", "mmap activation failed"),
+                "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+            }
 
-            stdout = r.stdout.strip()
-            stderr = r.stderr.strip()
+        self._swap_path = Path(mmap_result["swap_path"])
+        self._swap_size_bytes = swap_bytes
+        self._active = True
 
-            if r.returncode == 0:
-                logger.info("Pagefile registered: %s", stdout)
-                return True, ""
+        after_mem = self.get_system_memory()
+        added_gb = swap_bytes / (1024 ** 3)
 
-            err = stderr or stdout or "Unknown error"
-            logger.error("Pagefile registration failed: %s", err)
-
-            if "Access" in err or "denied" in err.lower():
-                return False, f"權限不足: {err}"
-
-            return False, f"Pagefile 建立失敗: {err}"
-
-        except subprocess.TimeoutExpired:
-            return False, "PowerShell 逾時 (30s)"
+        result = {
+            "success": True,
+            "method": "mmap_swap",
+            "swap_path": mmap_result["swap_path"],
+            "added_gb": round(added_gb, 1),
+            "total_usable_gb": round(after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
+            "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+            "needs_reboot": False,
+        }
+        if speed_warning_msg:
+            result["warning"] = speed_warning_msg
+        return result
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """取消 Windows pagefile 註冊，恢復自動管理，但保留 swap 檔案"""
-        if self._swap_path:
-            target_drive = str(self._swap_path)[0]
-            reg_key = r"HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-            try:
-                # 從 registry 移除我們的 pagefile + 恢復自動管理
-                _run_hidden(
-                    ["powershell", "-NoProfile", "-Command",
-                     "$ErrorActionPreference = 'SilentlyContinue'; "
-                     f"$regPath = '{reg_key}'; "
-                     "$current = (Get-ItemProperty $regPath -Name PagingFiles).PagingFiles; "
-                     "if ($current -is [string]) { $current = @($current) }; "
-                     f"$filtered = $current | Where-Object {{ $_ -and $_[0] -ne '{target_drive}' }}; "
-                     "if (-not $filtered) { $filtered = @() }; "
-                     "Set-ItemProperty $regPath -Name PagingFiles -Value $filtered; "
-                     "$sys = Get-CimInstance Win32_ComputerSystem; "
-                     "Set-CimInstance -InputObject $sys -Property @{AutomaticManagedPagefile=$true}"],
-                    timeout=10,
-                )
-            except (subprocess.TimeoutExpired, OSError) as e:
-                logger.warning("Pagefile deregistration error: %s", e)
-
-            logger.info("Pagefile unregistered, auto-managed restored, file kept: %s", self._swap_path)
-
+        """Deactivate mmap swap engine and release resources."""
+        if hasattr(self, '_mmap_engine') and self._mmap_engine:
+            self._mmap_engine.deactivate()
+            self._mmap_engine = None
         self._active = False
         self._swap_path = None
         self._swap_size_bytes = 0
-        logger.info("Windows swap deactivated")
         return {"success": True}
 
     # ── Linux: Swap File ──
@@ -697,6 +616,7 @@ class RealBoostEngine:
                 "swap_path": str(swap_path),
                 "added_gb": round(added_gb, 1),
                 "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
+                "needs_reboot": False,  # Linux swap 透過 swapon 立即生效
             }
             if speed_warning_msg:
                 result["warning"] = speed_warning_msg
