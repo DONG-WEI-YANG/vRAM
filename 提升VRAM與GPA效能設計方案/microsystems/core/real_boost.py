@@ -594,12 +594,17 @@ class RealBoostEngine:
         self._swap_size_bytes = total_swap_bytes
         self._active = True
 
+        # ── OS 辨識：在 C:\ 建立動態 pagefile（小檔案大上限） ──
+        # min=16MB 幾乎不佔空間，max=swap容量 讓 OS 認知增加
+        os_visible = self._create_os_beacon(total_swap_bytes, report)
+
         after_mem = self.get_system_memory()
         total_gb = total_swap_bytes / (1024 ** 3)
 
         return {
             "success": True,
             "method": "striped_mmap_swap" if len(self._mmap_engines) > 1 else "mmap_swap",
+            "os_visible": os_visible,
             "device_count": len(self._mmap_engines),
             "devices": device_details,
             "added_gb": round(total_gb, 1),
@@ -609,6 +614,110 @@ class RealBoostEngine:
             "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             "needs_reboot": False,
         }
+
+    @staticmethod
+    def _create_os_beacon(swap_size_bytes: int, report) -> bool:
+        """
+        在 C:\\ 建立動態 pagefile — 讓 OS 辨識資源增加。
+
+        min=16MB（幾乎不佔空間），max=swap_size（Task Manager 看到的增加量）。
+        pagefile 只在真的有東西 page 到 C:\\ 時才成長。
+        因為 AI 工作負載走裝置 mmap，C:\\ pagefile 幾乎不會被用到。
+        """
+        import ctypes
+        import ctypes.wintypes
+
+        pf_path = "C:\\vram_boost.sys"
+        BEACON_MIN = 16 * 1024 * 1024  # 16MB — 最小佔用
+
+        # 已 active → 跳過
+        if os.path.exists(pf_path):
+            try:
+                with open(pf_path, "r+b"):
+                    pass
+                os.unlink(pf_path)
+            except (PermissionError, OSError):
+                report("OS beacon already active")
+                return True
+
+        # 啟用 SeCreatePagefilePrivilege
+        try:
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+            advapi32.OpenProcessToken.argtypes = [
+                ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                ctypes.POINTER(ctypes.wintypes.HANDLE)]
+            advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
+
+            class LUID(ctypes.Structure):
+                _fields_ = [("LowPart", ctypes.wintypes.DWORD),
+                             ("HighPart", ctypes.c_long)]
+            class LUID_AND_ATTRIBUTES(ctypes.Structure):
+                _fields_ = [("Luid", LUID), ("Attributes", ctypes.wintypes.DWORD)]
+            class TOKEN_PRIVILEGES(ctypes.Structure):
+                _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
+                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+            hToken = ctypes.wintypes.HANDLE()
+            advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
+            luid = LUID()
+            advapi32.LookupPrivilegeValueW(
+                None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
+            tp = TOKEN_PRIVILEGES()
+            tp.PrivilegeCount = 1
+            tp.Privileges[0].Luid = luid
+            tp.Privileges[0].Attributes = 0x00000002
+            advapi32.AdjustTokenPrivileges(
+                hToken, False, ctypes.byref(tp), 0, None, None)
+            kernel32.CloseHandle(hToken)
+        except (OSError, AttributeError):
+            pass
+
+        # NtCreatePagingFile(min=16MB, max=swap_size)
+        try:
+            class UNICODE_STRING(ctypes.Structure):
+                _fields_ = [('Length', ctypes.c_ushort),
+                             ('MaximumLength', ctypes.c_ushort),
+                             ('Buffer', ctypes.c_wchar_p)]
+            class LARGE_INTEGER(ctypes.Structure):
+                _fields_ = [('QuadPart', ctypes.c_longlong)]
+
+            ntdll = ctypes.WinDLL('ntdll')
+            fn = ntdll.NtCreatePagingFile
+            fn.restype = ctypes.c_long
+            fn.argtypes = [ctypes.POINTER(UNICODE_STRING),
+                           ctypes.POINTER(LARGE_INTEGER),
+                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
+
+            nt_path = f"\\??\\{pf_path}"
+            upath = UNICODE_STRING()
+            upath.Buffer = nt_path
+            upath.Length = len(nt_path) * 2
+            upath.MaximumLength = (len(nt_path) + 1) * 2
+
+            # 關鍵：min ≠ max → 動態 pagefile
+            min_s = LARGE_INTEGER()
+            min_s.QuadPart = BEACON_MIN  # 16MB 初始
+            max_s = LARGE_INTEGER()
+            max_s.QuadPart = swap_size_bytes  # 全量上限
+
+            status = fn(ctypes.byref(upath), ctypes.byref(min_s),
+                         ctypes.byref(max_s), 0)
+
+            if status == 0:
+                report(f"OS beacon: +{swap_size_bytes/(1024**3):.1f}GB visible (16MB on disk)")
+                logger.info("OS beacon created: min=16MB max=%dMB",
+                            swap_size_bytes // (1024**2))
+                return True
+
+            logger.warning("OS beacon failed: 0x%08X", status & 0xFFFFFFFF)
+            return False
+
+        except (OSError, AttributeError) as e:
+            logger.warning("OS beacon failed: %s", e)
+            return False
 
     @staticmethod
     def _benchmark_sequential_write(mount_path: str, size_mb: int = 8) -> float:
