@@ -94,16 +94,19 @@ class SwapFileManager:
             self._total_blocks,
         )
 
-        chunk = b"\x00" * _ALLOC_CHUNK
-        written = 0
+        # 既有檔案大小正確 → 直接複用
+        if self._path.exists() and self._path.stat().st_size == size_bytes:
+            logger.info("Swap file reuse (size matches)")
+            return
+
+        # 快速預配置：seek 到尾端寫 1 byte，讓 OS 配置空間
+        # 不實際寫滿（8GB 寫零在 USB 要好幾分鐘），mmap 會按需寫入
         with open(self._path, "wb") as f:
-            while written < size_bytes:
-                to_write = min(_ALLOC_CHUNK, size_bytes - written)
-                f.write(chunk[:to_write])
-                written += to_write
+            f.seek(size_bytes - 1)
+            f.write(b"\x00")
             f.flush()
 
-        logger.info("Swap file created successfully")
+        logger.info("Swap file created (sparse, %.1f MB)", size_bytes / (1024 ** 2))
 
     def open(self) -> None:
         """Open the swap file and build the block table."""

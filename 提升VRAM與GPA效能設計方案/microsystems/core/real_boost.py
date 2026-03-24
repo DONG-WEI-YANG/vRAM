@@ -353,12 +353,33 @@ class RealBoostEngine:
             "swap_used_gb": mem.get("swap_used", 0) / (1024 ** 3),
             "total_usable_gb": (mem.get("physical_total", 0) + mem.get("swap_total", 0)) / (1024 ** 3),
         }
-        if hasattr(self, '_mmap_engine') and self._mmap_engine:
-            mmap_st = self._mmap_engine.status()
-            result["device_state"] = mmap_st.get("device_state", "unknown")
-            result["degraded"] = mmap_st.get("degraded", False)
-            result["mapped_blocks"] = mmap_st.get("mapped_blocks", 0)
-            result["evicted_blocks"] = mmap_st.get("evicted_blocks", 0)
+        # 多裝置聚合狀態
+        engines = getattr(self, '_mmap_engines', [])
+        # Legacy single-engine fallback
+        if not engines and hasattr(self, '_mmap_engine') and self._mmap_engine:
+            engines = [self._mmap_engine]
+        if engines:
+            total_mapped = 0
+            total_evicted = 0
+            any_degraded = False
+            devices = []
+            for eng in engines:
+                st = eng.status()
+                total_mapped += st.get("mapped_blocks", 0)
+                total_evicted += st.get("evicted_blocks", 0)
+                if st.get("degraded"):
+                    any_degraded = True
+                devices.append({
+                    "path": st.get("swap_path", ""),
+                    "state": st.get("device_state", "unknown"),
+                    "degraded": st.get("degraded", False),
+                    "blocks": st.get("total_blocks", 0),
+                })
+            result["device_count"] = len(engines)
+            result["devices"] = devices
+            result["mapped_blocks"] = total_mapped
+            result["evicted_blocks"] = total_evicted
+            result["degraded"] = any_degraded
         return result
 
     @staticmethod
@@ -451,73 +472,145 @@ class RealBoostEngine:
         cls._gpu_cache_ts = now
         return info
 
-    # ── Windows: Hybrid Swap (C:\ pagefile + device mmap) ──
+    # ── Windows: Multi-Device Mmap Swap ──
+
+    def _scan_external_drives(self, primary_letter: str) -> list:
+        """掃描所有可用的外接裝置（排除 C: 和 D: 系統碟）"""
+        drives = [primary_letter]
+        # 直接用 os.path.exists 掃描所有磁碟代號，不依賴 PowerShell
+        for letter in "EFGHIJKLMNOPQRSTUVWXYZ":
+            if letter in drives or letter in ("C", "D"):
+                continue
+            if os.path.exists(f"{letter}:\\"):
+                try:
+                    usage = shutil.disk_usage(f"{letter}:\\")
+                    if usage.total > 1024 ** 3:  # > 1GB
+                        drives.append(letter)
+                except OSError:
+                    pass
+        return drives
 
     def _activate_windows(self, letter: str, use_pct: float,
                           report=None) -> Dict[str, Any]:
         """
-        混合模式：
-          1. C:\\ pagefile (NtCreatePagingFile) → 系統層級，Task Manager 可見
-          2. 裝置 mmap swap (MmapSwapEngine) → AI 工作負載，拔卡保護
-
-        兩者同時啟用，swap 大小由裝置速度公式決定。
+        多裝置 mmap swap：掃描所有外接裝置，各自建立 mmap swap。
+        零 C:\\ 佔用，資訊透過 GUI 顯示。
         """
         report = report or (lambda msg: None)
-        mount = f"{letter}:\\"
-        try:
-            usage = shutil.disk_usage(mount)
-        except OSError as e:
-            return {"success": False, "error": f"Cannot access {mount}: {e}"}
 
-        # 計算 swap 大小（受裝置速度上限約束）
-        wanted_bytes = int(usage.free * (use_pct / 100))
-        wanted_bytes, speed_warning_msg = self._cap_swap_by_speed(wanted_bytes)
-        swap_mb = wanted_bytes // (1024 * 1024)
+        # 掃描所有外接裝置
+        drives = self._scan_external_drives(letter)
+        report(f"found {len(drives)} device(s): {', '.join(d + ':' for d in drives)}")
 
-        if swap_mb < 512:
-            return {"success": False, "error": f"Not enough space: {swap_mb}MB < 512MB minimum"}
+        self._mmap_engines: list = []
+        total_swap_bytes = 0
+        device_details = []
 
-        swap_bytes = swap_mb * 1024 * 1024  # 對齊到 MB
+        for drv in drives:
+            mount = f"{drv}:\\"
+            try:
+                usage = shutil.disk_usage(mount)
+            except OSError:
+                report(f"{drv}: skipped (inaccessible)")
+                continue
 
-        # ── 裝置 mmap swap（零 C:\ 佔用） ──
-        report(f"activating device swap ({swap_mb // 1024}GB)...")
-        self._mmap_engine = MmapSwapEngine()
-        mmap_result = self._mmap_engine.activate(
-            device_path=mount,
-            size_bytes=swap_bytes,
-            on_progress=report,
-        )
+            if usage.free < 512 * (1024 ** 2):
+                report(f"{drv}: skipped (< 512MB free)")
+                continue
 
-        if not mmap_result.get("success"):
-            return {
-                "success": False,
-                "error": mmap_result.get("error", "mmap activation failed"),
-                "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
-            }
+            # 每個裝置獨立測速
+            report(f"{drv}: benchmarking...")
+            speed = self._benchmark_random_write(mount, test_size_mb=4)
+            # 同時測順序寫入，取等效速度（寫入緩衝優化）
+            seq_speed = self._benchmark_sequential_write(mount)
+            effective_speed = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
 
-        self._swap_path = Path(mmap_result["swap_path"])
-        self._swap_size_bytes = swap_bytes
+            # 用等效速度計算 swap 上限
+            old_speed = self._measured_rand_write_mbs
+            self._measured_rand_write_mbs = effective_speed
+            wanted = int(usage.free * (use_pct / 100))
+            wanted, _ = self._cap_swap_by_speed(wanted)
+            self._measured_rand_write_mbs = old_speed  # restore
+
+            swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
+            if swap_bytes < 512 * (1024 ** 2):
+                report(f"{drv}: skipped (swap too small)")
+                continue
+
+            swap_gb = swap_bytes / (1024 ** 3)
+            report(f"{drv}: {effective_speed:.0f} MB/s → {swap_gb:.1f}GB swap")
+
+            engine = MmapSwapEngine()
+            result = engine.activate(
+                device_path=mount,
+                size_bytes=swap_bytes,
+                on_progress=lambda msg, d=drv: report(f"{d}: {msg}"),
+            )
+
+            if result.get("success"):
+                self._mmap_engines.append(engine)
+                total_swap_bytes += swap_bytes
+                device_details.append({
+                    "drive": drv,
+                    "speed_mbs": round(effective_speed, 1),
+                    "swap_gb": round(swap_gb, 1),
+                    "blocks": result.get("total_blocks", 0),
+                })
+            else:
+                report(f"{drv}: failed ({result.get('error', '?')})")
+
+        if not self._mmap_engines:
+            return {"success": False, "error": "No devices activated"}
+
+        self._swap_size_bytes = total_swap_bytes
         self._active = True
 
         after_mem = self.get_system_memory()
-        added_gb = swap_bytes / (1024 ** 3)
+        total_gb = total_swap_bytes / (1024 ** 3)
 
-        result = {
+        return {
             "success": True,
             "method": "mmap_swap",
-            "swap_path": mmap_result["swap_path"],
-            "added_gb": round(added_gb, 1),
+            "device_count": len(self._mmap_engines),
+            "devices": device_details,
+            "added_gb": round(total_gb, 1),
             "total_usable_gb": round(
-                after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
+                after_mem.get("physical_total", 0) / (1024**3) + total_gb, 1),
             "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             "needs_reboot": False,
         }
-        if speed_warning_msg:
-            result["warning"] = speed_warning_msg
-        return result
+
+    @staticmethod
+    def _benchmark_sequential_write(mount_path: str, size_mb: int = 16) -> float:
+        """順序寫入測速（Write-Back Buffer 的等效速度基準）"""
+        test_file = Path(mount_path) / ".vram_seq_test"
+        chunk = os.urandom(1024 * 1024)  # 1MB
+        try:
+            start = time.perf_counter()
+            with open(test_file, "wb", buffering=0) as f:
+                for _ in range(size_mb):
+                    f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            elapsed = time.perf_counter() - start
+            return size_mb / elapsed if elapsed > 0 else 0
+        except OSError:
+            return 0
+        finally:
+            try:
+                test_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉 mmap swap，釋放裝置上的映射。零 C:\\ 佔用。"""
+        """關閉所有裝置的 mmap swap。"""
+        for engine in getattr(self, '_mmap_engines', []):
+            try:
+                engine.deactivate()
+            except (OSError, Exception) as e:
+                logger.warning("Deactivate error: %s", e)
+        self._mmap_engines = []
+        # Legacy single-engine cleanup
         if hasattr(self, '_mmap_engine') and self._mmap_engine:
             self._mmap_engine.deactivate()
             self._mmap_engine = None
