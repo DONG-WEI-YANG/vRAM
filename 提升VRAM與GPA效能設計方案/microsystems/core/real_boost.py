@@ -479,15 +479,7 @@ class RealBoostEngine:
 
         swap_bytes = swap_mb * 1024 * 1024  # 對齊到 MB
 
-        # ── Layer 1: C:\ pagefile（系統層級，上限 2GB） ──
-        # C:\ pagefile 只是讓 Task Manager 看到記憶體增加，不需要太大
-        # 高速裝置的 swap 可能 60-180GB，全放 C:\ 會造成負擔
-        PAGEFILE_CAP = 2 * (1024 ** 3)  # 2GB 上限
-        pagefile_size = min(swap_bytes, PAGEFILE_CAP)
-        report("activating system pagefile...")
-        pagefile_ok = self._create_system_pagefile(pagefile_size, report)
-
-        # ── Layer 2: 裝置 mmap swap（AI 層級） ──
+        # ── 裝置 mmap swap（零 C:\ 佔用） ──
         report(f"activating device swap ({swap_mb // 1024}GB)...")
         self._mmap_engine = MmapSwapEngine()
         mmap_result = self._mmap_engine.activate(
@@ -496,139 +488,36 @@ class RealBoostEngine:
             on_progress=report,
         )
 
-        if not mmap_result.get("success") and not pagefile_ok:
+        if not mmap_result.get("success"):
             return {
                 "success": False,
-                "error": "Both pagefile and mmap swap failed",
+                "error": mmap_result.get("error", "mmap activation failed"),
                 "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             }
 
-        self._swap_path = Path(mmap_result.get("swap_path", f"{mount}vram_boost.swap"))
+        self._swap_path = Path(mmap_result["swap_path"])
         self._swap_size_bytes = swap_bytes
         self._active = True
 
         after_mem = self.get_system_memory()
         added_gb = swap_bytes / (1024 ** 3)
-        method_parts = []
-        if pagefile_ok:
-            method_parts.append("pagefile")
-        if mmap_result.get("success"):
-            method_parts.append("mmap_swap")
 
         result = {
             "success": True,
-            "method": "+".join(method_parts),
-            "swap_path": mmap_result.get("swap_path", ""),
+            "method": "mmap_swap",
+            "swap_path": mmap_result["swap_path"],
             "added_gb": round(added_gb, 1),
             "total_usable_gb": round(
                 after_mem.get("physical_total", 0) / (1024**3) + added_gb, 1),
             "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             "needs_reboot": False,
-            "pagefile_active": pagefile_ok,
-            "mmap_active": mmap_result.get("success", False),
         }
         if speed_warning_msg:
             result["warning"] = speed_warning_msg
         return result
 
-    def _create_system_pagefile(self, size_bytes: int, report) -> bool:
-        """
-        用 NtCreatePagingFile 在 C:\\ 建立系統級 pagefile。
-        讓系統 commit limit 增加，Task Manager 可見。
-        失敗時靜默（mmap swap 仍可用）。
-        """
-        import ctypes
-        import ctypes.wintypes
-
-        pf_path = "C:\\vram_boost.sys"
-
-        # 已 active（檔案被系統鎖定）→ 直接回報成功
-        if os.path.exists(pf_path):
-            try:
-                with open(pf_path, "r+b"):
-                    pass
-                os.unlink(pf_path)  # 能開 → 殘留檔，刪掉重建
-            except (PermissionError, OSError):
-                report("system pagefile already active")
-                return True
-
-        # 啟用 SeCreatePagefilePrivilege
-        try:
-            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-            advapi32.OpenProcessToken.argtypes = [
-                ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
-                ctypes.POINTER(ctypes.wintypes.HANDLE)]
-            advapi32.OpenProcessToken.restype = ctypes.wintypes.BOOL
-
-            class LUID(ctypes.Structure):
-                _fields_ = [("LowPart", ctypes.wintypes.DWORD),
-                             ("HighPart", ctypes.c_long)]
-            class LUID_AND_ATTRIBUTES(ctypes.Structure):
-                _fields_ = [("Luid", LUID), ("Attributes", ctypes.wintypes.DWORD)]
-            class TOKEN_PRIVILEGES(ctypes.Structure):
-                _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
-                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
-
-            hToken = ctypes.wintypes.HANDLE()
-            advapi32.OpenProcessToken(
-                kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
-            luid = LUID()
-            advapi32.LookupPrivilegeValueW(
-                None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
-            tp = TOKEN_PRIVILEGES()
-            tp.PrivilegeCount = 1
-            tp.Privileges[0].Luid = luid
-            tp.Privileges[0].Attributes = 0x00000002
-            advapi32.AdjustTokenPrivileges(
-                hToken, False, ctypes.byref(tp), 0, None, None)
-            kernel32.CloseHandle(hToken)
-        except (OSError, AttributeError):
-            pass
-
-        # NtCreatePagingFile
-        try:
-            class UNICODE_STRING(ctypes.Structure):
-                _fields_ = [('Length', ctypes.c_ushort),
-                             ('MaximumLength', ctypes.c_ushort),
-                             ('Buffer', ctypes.c_wchar_p)]
-            class LARGE_INTEGER(ctypes.Structure):
-                _fields_ = [('QuadPart', ctypes.c_longlong)]
-
-            ntdll = ctypes.WinDLL('ntdll')
-            fn = ntdll.NtCreatePagingFile
-            fn.restype = ctypes.c_long
-            fn.argtypes = [ctypes.POINTER(UNICODE_STRING),
-                           ctypes.POINTER(LARGE_INTEGER),
-                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
-
-            nt_path = f"\\??\\{pf_path}"
-            upath = UNICODE_STRING()
-            upath.Buffer = nt_path
-            upath.Length = len(nt_path) * 2
-            upath.MaximumLength = (len(nt_path) + 1) * 2
-            min_s = LARGE_INTEGER(); min_s.QuadPart = size_bytes
-            max_s = LARGE_INTEGER(); max_s.QuadPart = size_bytes
-
-            status = fn(ctypes.byref(upath), ctypes.byref(min_s),
-                         ctypes.byref(max_s), 0)
-
-            if status == 0:
-                report("system pagefile activated (C:\\)")
-                logger.info("NtCreatePagingFile OK: %s (%dMB)",
-                            pf_path, size_bytes // (1024**2))
-                return True
-
-            logger.warning("NtCreatePagingFile: 0x%08X", status & 0xFFFFFFFF)
-            return False
-
-        except (OSError, AttributeError) as e:
-            logger.warning("System pagefile failed: %s", e)
-            return False
-
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉 mmap swap。C:\\ pagefile 在下次開機自動消失。"""
+        """關閉 mmap swap，釋放裝置上的映射。零 C:\\ 佔用。"""
         if hasattr(self, '_mmap_engine') and self._mmap_engine:
             self._mmap_engine.deactivate()
             self._mmap_engine = None
