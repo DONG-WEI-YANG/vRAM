@@ -290,7 +290,7 @@ class StripedSwapScheduler:
         }
 
     def close(self):
-        """關閉 thread pool。"""
+        """關閉 thread pool，等待所有 worker 完成。"""
         if self._pool:
-            self._pool.shutdown(wait=False)
+            self._pool.shutdown(wait=True)
             self._pool = None

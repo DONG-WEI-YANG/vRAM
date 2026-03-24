@@ -88,8 +88,11 @@ class RealBoostEngine:
         self._striped: Optional[StripedSwapScheduler] = None
         self._known_drives: set = set()
         self._beacon_count: int = 0
+        self._beacon_paths: list = []       # 追蹤所有 beacon 路徑
+        self._beacon_total_bytes: int = 0   # beacon 回報的總量
         self._hotdetect_thread: Optional[threading.Thread] = None
         self._hotdetect_stop = threading.Event()
+        self._engine_swap_bytes: Dict[int, int] = {}  # engine id → swap bytes
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
 
@@ -350,23 +353,39 @@ class RealBoostEngine:
             return self._deactivate_linux()
 
     def status(self) -> Dict[str, Any]:
-        """取得真實的系統記憶體狀態"""
+        """取得真實的系統記憶體狀態（含 beacon 誠信檢查）"""
         mem = self.get_system_memory()
+
+        # 計算真實可用的外接 swap（只算連線中的裝置）
+        real_swap_bytes = 0
+        engines = getattr(self, '_mmap_engines', [])
+        if not engines and hasattr(self, '_mmap_engine') and self._mmap_engine:
+            engines = [self._mmap_engine]
+        for eng in engines:
+            st = eng.status()
+            if not st.get("degraded", False):
+                real_swap_bytes += self._engine_swap_bytes.get(id(eng), 0)
+
         result = {
             "active": self._active,
             "swap_path": str(self._swap_path) if self._swap_path else None,
             "swap_size_gb": self._swap_size_bytes / (1024 ** 3),
+            "real_swap_gb": real_swap_bytes / (1024 ** 3),
             "physical_ram_gb": mem.get("physical_total", 0) / (1024 ** 3),
             "available_ram_gb": mem.get("physical_available", 0) / (1024 ** 3),
             "swap_total_gb": mem.get("swap_total", 0) / (1024 ** 3),
             "swap_used_gb": mem.get("swap_used", 0) / (1024 ** 3),
-            "total_usable_gb": (mem.get("physical_total", 0) + mem.get("swap_total", 0)) / (1024 ** 3),
+            "total_usable_gb": (mem.get("physical_total", 0) + real_swap_bytes) / (1024 ** 3),
         }
+
+        # beacon 誠信：回報 beacon 是否與真實可用量一致
+        beacon_bytes = getattr(self, '_beacon_total_bytes', 0)
+        if beacon_bytes > 0 and real_swap_bytes < beacon_bytes:
+            result["beacon_stale"] = True
+            result["beacon_reported_gb"] = beacon_bytes / (1024 ** 3)
+            result["beacon_overreport_gb"] = (beacon_bytes - real_swap_bytes) / (1024 ** 3)
+
         # 多裝置聚合狀態
-        engines = getattr(self, '_mmap_engines', [])
-        # Legacy single-engine fallback
-        if not engines and hasattr(self, '_mmap_engine') and self._mmap_engine:
-            engines = [self._mmap_engine]
         if engines:
             total_mapped = 0
             total_evicted = 0
@@ -568,10 +587,12 @@ class RealBoostEngine:
                 device_path=mount,
                 size_bytes=swap_bytes,
                 on_progress=lambda msg, d=drv: report(f"{d}: {msg}"),
+                on_state_change=lambda state, d=drv: self._on_device_state_changed(d, state),
             )
 
             if result.get("success"):
                 self._mmap_engines.append(engine)
+                self._engine_swap_bytes[id(engine)] = swap_bytes
                 total_swap_bytes += swap_bytes
                 device_details.append({
                     "drive": drv,
@@ -607,6 +628,8 @@ class RealBoostEngine:
         # ── OS 辨識：在 C:\ 建立動態 pagefile（小檔案大上限） ──
         os_visible = self._create_os_beacon(total_swap_bytes, report)
         self._beacon_count = 1 if os_visible else 0
+        self._beacon_paths = ["C:\\vram_boost.sys"] if os_visible else []
+        self._beacon_total_bytes = total_swap_bytes if os_visible else 0
 
         # ── 背景熱偵測：每 30 秒掃描新裝置 ──
         self._hotdetect_stop.clear()
@@ -691,10 +714,14 @@ class RealBoostEngine:
 
             # 建立 mmap swap
             engine = MmapSwapEngine()
-            result = engine.activate(device_path=mount, size_bytes=swap_bytes)
+            result = engine.activate(
+                device_path=mount, size_bytes=swap_bytes,
+                on_state_change=lambda state, d=drv: self._on_device_state_changed(d, state),
+            )
 
             if result.get("success"):
                 self._mmap_engines.append(engine)
+                self._engine_swap_bytes[id(engine)] = swap_bytes
                 self._swap_size_bytes += swap_bytes
                 self._known_drives.add(drv)
 
@@ -704,10 +731,124 @@ class RealBoostEngine:
                 # 額外 OS beacon
                 self._beacon_count += 1
                 beacon_name = f"C:\\vram_boost_{self._beacon_count}.sys"
-                self._create_os_beacon_named(beacon_name, swap_bytes)
+                if self._create_os_beacon_named(beacon_name, swap_bytes):
+                    self._beacon_paths.append(beacon_name)
+                    self._beacon_total_bytes += swap_bytes
 
                 swap_gb = swap_bytes / (1024 ** 3)
                 logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
+
+    # ── 裝置狀態變化 → 動態調整 beacon ──
+
+    def _on_device_state_changed(self, drive_letter: str, state: str) -> None:
+        """
+        由 MmapSwapEngine 的 on_state_change callback 觸發。
+        state = "degraded" (裝置斷線) 或 "restored" (裝置恢復)
+        """
+        logger.info("Device %s: state → %s", drive_letter, state)
+
+        if state == "degraded":
+            # 重新計算：只算仍在連線中的裝置
+            alive_bytes = 0
+            for eng in self._mmap_engines:
+                st = eng.status()
+                if not st.get("degraded", False):
+                    alive_bytes += self._engine_swap_bytes.get(id(eng), 0)
+
+            lost_bytes = self._swap_size_bytes - alive_bytes
+            logger.info("Device %s: disconnected — lost %.1fGB, remaining %.1fGB",
+                        drive_letter, lost_bytes / (1024**3), alive_bytes / (1024**3))
+
+            self._adjust_beacon(alive_bytes)
+
+        elif state == "restored":
+            # 裝置恢復：重新計算全量
+            total_bytes = sum(
+                self._engine_swap_bytes.get(id(eng), 0)
+                for eng in self._mmap_engines
+                if not eng.status().get("degraded", False)
+            )
+            logger.info("Device %s: restored — total %.1fGB", drive_letter, total_bytes / (1024**3))
+            self._adjust_beacon(total_bytes)
+
+    def _adjust_beacon(self, target_bytes: int) -> None:
+        """
+        嘗試調整 OS beacon 大小以反映真實可用的外接 swap。
+
+        Windows 限制：NtCreatePagingFile 無法縮小已建立的 pagefile。
+        策略：嘗試用 min=max=16MB 重建，讓 OS 不再把它當大 pagefile。
+        如果失敗（預期中），標記 beacon 為 stale，status() 會誠實回報。
+        """
+        if not self._is_windows or not self._beacon_paths:
+            return
+
+        if target_bytes >= self._beacon_total_bytes:
+            # 不需要縮 — 恢復或持平
+            return
+
+        BEACON_MIN = 16 * 1024 * 1024
+
+        # 嘗試對每個 beacon pagefile 用新的 max 重建
+        # NtCreatePagingFile 對已 active 的 pagefile 預期會失敗，
+        # 但如果 OS 允許 resize 那就直接成功
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class UNICODE_STRING(ctypes.Structure):
+                _fields_ = [('Length', ctypes.c_ushort),
+                             ('MaximumLength', ctypes.c_ushort),
+                             ('Buffer', ctypes.c_wchar_p)]
+            class LARGE_INTEGER(ctypes.Structure):
+                _fields_ = [('QuadPart', ctypes.c_longlong)]
+
+            ntdll = ctypes.WinDLL('ntdll')
+            fn = ntdll.NtCreatePagingFile
+            fn.restype = ctypes.c_long
+            fn.argtypes = [ctypes.POINTER(UNICODE_STRING),
+                           ctypes.POINTER(LARGE_INTEGER),
+                           ctypes.POINTER(LARGE_INTEGER), ctypes.c_ulong]
+
+            # 算出每個 beacon 應該分到多少（等比縮小）
+            n_beacons = len(self._beacon_paths)
+            per_beacon = max(BEACON_MIN, target_bytes // n_beacons) if n_beacons else 0
+
+            adjusted = False
+            for pf_path in self._beacon_paths:
+                nt_path = f"\\??\\{pf_path}"
+                upath = UNICODE_STRING()
+                upath.Buffer = nt_path
+                upath.Length = len(nt_path) * 2
+                upath.MaximumLength = (len(nt_path) + 1) * 2
+
+                min_s = LARGE_INTEGER()
+                min_s.QuadPart = BEACON_MIN
+                max_s = LARGE_INTEGER()
+                max_s.QuadPart = per_beacon if target_bytes > 0 else BEACON_MIN
+
+                status = fn(ctypes.byref(upath), ctypes.byref(min_s),
+                            ctypes.byref(max_s), 0)
+                if status == 0:
+                    logger.info("Beacon %s resized to %dMB", pf_path, per_beacon // (1024**2))
+                    adjusted = True
+                else:
+                    logger.warning("Beacon %s resize failed (0x%08X) — stale until restart",
+                                   pf_path, status & 0xFFFFFFFF)
+
+            if adjusted:
+                self._beacon_total_bytes = target_bytes
+            else:
+                # 無法縮小：誠實記錄，status() 會回報差異
+                logger.warning(
+                    "Cannot shrink beacon at runtime (Windows limitation). "
+                    "Beacon reports %.1fGB but real available is %.1fGB. "
+                    "Will correct on next activation.",
+                    self._beacon_total_bytes / (1024**3),
+                    target_bytes / (1024**3),
+                )
+
+        except (OSError, AttributeError) as e:
+            logger.warning("Beacon adjustment failed: %s", e)
 
     def _create_os_beacon_named(self, pf_path: str, size_bytes: int) -> bool:
         """建立具名 OS beacon（用於熱插入的額外裝置）。"""
@@ -920,11 +1061,13 @@ class RealBoostEngine:
                 pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect。"""
-        # 停止熱偵測
+        """關閉所有裝置的 mmap swap + striped scheduler + hot-detect + beacon 清理。"""
+        # 停止熱偵測（SD 卡 I/O 可能卡 30s+，給足夠時間）
         self._hotdetect_stop.set()
         if self._hotdetect_thread and self._hotdetect_thread.is_alive():
-            self._hotdetect_thread.join(timeout=5)
+            self._hotdetect_thread.join(timeout=15)
+            if self._hotdetect_thread.is_alive():
+                logger.warning("Hot-detect thread did not stop within 15s")
         self._hotdetect_thread = None
 
         if hasattr(self, '_striped') and self._striped:
@@ -936,11 +1079,29 @@ class RealBoostEngine:
             except (OSError, Exception) as e:
                 logger.warning("Deactivate error: %s", e)
         self._mmap_engines = []
+        self._engine_swap_bytes = {}
         self._known_drives = set()
         # Legacy single-engine cleanup
         if hasattr(self, '_mmap_engine') and self._mmap_engine:
             self._mmap_engine.deactivate()
             self._mmap_engine = None
+
+        # ── 清理 beacon pagefile ──
+        # Runtime 無法刪除 active pagefile（OS 鎖住），
+        # 但 deactivate 後嘗試歸零 + 刪除，至少下次啟動不會殘留。
+        self._adjust_beacon(0)
+        for pf_path in getattr(self, '_beacon_paths', []):
+            try:
+                if os.path.exists(pf_path):
+                    os.unlink(pf_path)
+                    logger.info("Beacon file removed: %s", pf_path)
+            except (PermissionError, OSError):
+                # pagefile 仍被 OS 鎖住 — 正常，重開機後自動消失
+                logger.info("Beacon %s locked by OS, will clean on reboot", pf_path)
+        self._beacon_paths = []
+        self._beacon_total_bytes = 0
+        self._beacon_count = 0
+
         self._active = False
         self._swap_path = None
         self._swap_size_bytes = 0

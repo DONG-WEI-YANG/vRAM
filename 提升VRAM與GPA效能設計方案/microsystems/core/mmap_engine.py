@@ -144,7 +144,9 @@ class MmapSwapEngine:
         """Stop monitoring and release all resources."""
         self._stop_event.set()
         if self._monitor_thread is not None:
-            self._monitor_thread.join(timeout=10)
+            self._monitor_thread.join(timeout=15)
+            if self._monitor_thread.is_alive():
+                logger.warning("Monitor thread did not stop within 15s")
             self._monitor_thread = None
 
         if self._swap is not None:
@@ -212,6 +214,7 @@ class MmapSwapEngine:
     def _on_disconnect(self) -> None:
         """Called when the breaker trips due to device loss."""
         logger.warning("Device disconnected -- entering degraded mode")
+        leaked = 0
         if self._swap is not None:
             for bid in list(self._swap.blocks):
                 blk = self._swap.blocks[bid]
@@ -219,9 +222,11 @@ class MmapSwapEngine:
                     try:
                         blk.mmap_obj.close()
                     except Exception:
-                        pass
+                        leaked += 1
                     blk.mmap_obj = None
                 blk.state = "evicted"
+        if leaked:
+            logger.warning("Failed to close %d mmap handles (device removed mid-I/O)", leaked)
 
         self._degraded = True
         if self._on_state_change:

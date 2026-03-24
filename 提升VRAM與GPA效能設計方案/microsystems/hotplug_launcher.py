@@ -639,7 +639,7 @@ class BoosterApp:
 
         def shutdown():
             # 用 lock 確保不會跟 activate 同時跑
-            acquired = self._engine_lock.acquire(timeout=5)
+            acquired = self._engine_lock.acquire(timeout=10)
             try:
                 if self._boost_engine:
                     self._boost_engine.deactivate()
@@ -649,14 +649,23 @@ class BoosterApp:
                 if acquired:
                     self._engine_lock.release()
 
-        # 在背景執行關機，最多等 5 秒
+        # 在背景執行關機，等待足夠長讓 SD 卡 I/O 完成
         t = threading.Thread(target=shutdown, daemon=True)
         t.start()
-        t.join(timeout=5)
+        t.join(timeout=15)
         if t.is_alive():
-            logger.warning("Deactivate timed out after 5s, forcing exit")
+            logger.warning("Deactivate timed out after 15s, forcing exit")
 
         self._system = None
+
+        # 關閉所有 log file handle，釋放 exe 所在目錄的檔案鎖
+        for handler in logging.root.handlers[:]:
+            try:
+                handler.close()
+                logging.root.removeHandler(handler)
+            except Exception:
+                pass
+
         if self._root:
             self._root.destroy()
 
@@ -773,7 +782,21 @@ def _elevate_linux():
 
 # ── Entry Point ──
 
+def _cleanup_at_exit():
+    """atexit handler：確保即使異常退出也能釋放資源。"""
+    # 關閉所有 log handler，釋放檔案鎖
+    for handler in logging.root.handlers[:]:
+        try:
+            handler.close()
+            logging.root.removeHandler(handler)
+        except Exception:
+            pass
+
+
 def main():
+    import atexit
+    atexit.register(_cleanup_at_exit)
+
     # 持久化 log 到 exe 所在目錄（SD 卡上）
     log_handlers = [logging.StreamHandler()]
     try:
