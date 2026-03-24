@@ -519,12 +519,27 @@ class RealBoostEngine:
                 report(f"{drv}: skipped (< 512MB free)")
                 continue
 
-            # 每個裝置獨立測速
+            # 每個裝置獨立測速（有快取就用快取，取歷史最佳）
+            cached = self._load_cached_config(mount)
+            cached_speed = cached.get("effective_speed_mbs", 0) if cached else 0
+
             report(f"{drv}: benchmarking...")
             speed = self._benchmark_random_write(mount, test_size_mb=4)
-            # 同時測順序寫入，取等效速度（寫入緩衝優化）
             seq_speed = self._benchmark_sequential_write(mount)
-            effective_speed = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
+            measured = max(speed, seq_speed * 0.7) if seq_speed > speed * 3 else speed
+
+            # 取歷史最佳和本次測量的較大值，避免單次波動縮小 swap
+            effective_speed = max(measured, cached_speed)
+            if effective_speed > measured:
+                report(f"{drv}: using cached speed {effective_speed:.0f} MB/s (measured {measured:.0f})")
+
+            # 存回快取（含等效速度）
+            self._save_config(mount, {
+                "rand_write_mbs": speed,
+                "seq_write_mbs": seq_speed,
+                "effective_speed_mbs": effective_speed,
+                "drive_letter": drv,
+            })
 
             # 用等效速度計算 swap 上限
             old_speed = self._measured_rand_write_mbs
