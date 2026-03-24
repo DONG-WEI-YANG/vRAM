@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Callable
 
 from .mmap_engine import MmapSwapEngine
+from .striped_swap import StripedSwapScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -562,20 +563,28 @@ class RealBoostEngine:
         if not self._mmap_engines:
             return {"success": False, "error": "No devices activated"}
 
+        # ── 建立 Striped Scheduler（平行 I/O 調度） ──
+        self._striped = StripedSwapScheduler()
+        for eng, detail in zip(self._mmap_engines, device_details):
+            self._striped.add_device(eng, detail["speed_mbs"])
+
         self._swap_size_bytes = total_swap_bytes
         self._active = True
 
         after_mem = self.get_system_memory()
         total_gb = total_swap_bytes / (1024 ** 3)
 
+        striped_speed = self._striped.total_speed_mbs
+
         return {
             "success": True,
-            "method": "mmap_swap",
+            "method": "striped_mmap_swap" if len(self._mmap_engines) > 1 else "mmap_swap",
             "device_count": len(self._mmap_engines),
             "devices": device_details,
             "added_gb": round(total_gb, 1),
             "total_usable_gb": round(
                 after_mem.get("physical_total", 0) / (1024**3) + total_gb, 1),
+            "combined_speed_mbs": round(striped_speed, 1),
             "rand_write_mbs": round(self._measured_rand_write_mbs, 1),
             "needs_reboot": False,
         }
@@ -603,7 +612,10 @@ class RealBoostEngine:
                 pass
 
     def _deactivate_windows(self) -> Dict[str, Any]:
-        """關閉所有裝置的 mmap swap。"""
+        """關閉所有裝置的 mmap swap + striped scheduler。"""
+        if hasattr(self, '_striped') and self._striped:
+            self._striped.close()
+            self._striped = None
         for engine in getattr(self, '_mmap_engines', []):
             try:
                 engine.deactivate()
