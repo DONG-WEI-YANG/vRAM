@@ -29,6 +29,11 @@ class DeviceSlot:
     weight: float = 0.0        # 分配權重 (0-1)
     allocated_blocks: int = 0  # 已分配的 block 數
     total_blocks: int = 0      # 裝置的總 block 數
+    # Runtime protection
+    throttled: bool = False    # 延遲過高時標記
+    avg_latency_ms: float = 0.0  # 滑動平均延遲
+    io_count: int = 0         # I/O 次數
+    io_errors: int = 0        # I/O 錯誤次數
 
 
 @dataclass
@@ -103,6 +108,7 @@ class StripedSwapScheduler:
         """
         with self._lock:
             # 選最「空閒」的裝置（已分配 / 權重 最小的）
+            # 節流中的裝置降低優先級但不完全跳過（避免其他裝置也壓力過大）
             best = None
             best_ratio = float('inf')
             for i, dev in enumerate(self._devices):
@@ -111,6 +117,8 @@ class StripedSwapScheduler:
                 if dev.weight <= 0:
                     continue
                 ratio = dev.allocated_blocks / dev.weight
+                if dev.throttled:
+                    ratio *= 10  # 節流裝置排到最後
                 if ratio < best_ratio:
                     best_ratio = ratio
                     best = i
@@ -134,8 +142,13 @@ class StripedSwapScheduler:
 
             return block
 
+    # ── Runtime Protection Constants ──
+    THROTTLE_LATENCY_MS = 5000    # 單次 I/O > 5 秒 → 標記節流
+    UNTHROTTLE_LATENCY_MS = 1000  # 平均延遲降回 1 秒 → 解除節流
+    LATENCY_ALPHA = 0.3           # 滑動平均權重（越大越敏感）
+
     def write(self, logical_id: int, data: bytes, offset: int = 0) -> bool:
-        """寫入單一 block（導向正確裝置）。"""
+        """寫入單一 block，追蹤延遲，自動節流保護。"""
         block = self._block_map.get(logical_id)
         if not block:
             return False
@@ -143,11 +156,15 @@ class StripedSwapScheduler:
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
             return False
-        return swap.write_block(block.local_block_id, data, offset)
+
+        t0 = time.perf_counter()
+        ok = swap.write_block(block.local_block_id, data, offset)
+        self._update_latency(dev, time.perf_counter() - t0, ok)
+        return ok
 
     def read(self, logical_id: int, offset: int = 0,
              size: int = -1) -> Optional[bytes]:
-        """讀取單一 block（導向正確裝置）。"""
+        """讀取單一 block，追蹤延遲，自動節流保護。"""
         block = self._block_map.get(logical_id)
         if not block:
             return None
@@ -155,7 +172,41 @@ class StripedSwapScheduler:
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
             return None
-        return swap.read_block(block.local_block_id, offset, size)
+
+        t0 = time.perf_counter()
+        result = swap.read_block(block.local_block_id, offset, size)
+        self._update_latency(dev, time.perf_counter() - t0, result is not None)
+        return result
+
+    def _update_latency(self, dev: DeviceSlot, elapsed_s: float, success: bool):
+        """更新裝置延遲統計，觸發/解除節流。"""
+        latency_ms = elapsed_s * 1000
+        dev.io_count += 1
+
+        if not success:
+            dev.io_errors += 1
+
+        # 滑動平均（EMA）
+        if dev.avg_latency_ms == 0:
+            dev.avg_latency_ms = latency_ms
+        else:
+            dev.avg_latency_ms = (
+                self.LATENCY_ALPHA * latency_ms +
+                (1 - self.LATENCY_ALPHA) * dev.avg_latency_ms
+            )
+
+        # 節流觸發：單次延遲過高
+        if latency_ms > self.THROTTLE_LATENCY_MS and not dev.throttled:
+            dev.throttled = True
+            logger.warning("Device #%d throttled: latency %.0fms > %dms",
+                           self._devices.index(dev), latency_ms,
+                           self.THROTTLE_LATENCY_MS)
+
+        # 節流解除：平均延遲恢復
+        if dev.throttled and dev.avg_latency_ms < self.UNTHROTTLE_LATENCY_MS:
+            dev.throttled = False
+            logger.info("Device #%d unthrottled: avg latency %.0fms",
+                         self._devices.index(dev), dev.avg_latency_ms)
 
     def write_parallel(self, items: List[Tuple[int, bytes]]) -> List[bool]:
         """
@@ -225,6 +276,10 @@ class StripedSwapScheduler:
                 "weight": round(dev.weight, 2),
                 "allocated": dev.allocated_blocks,
                 "total": dev.total_blocks,
+                "throttled": dev.throttled,
+                "avg_latency_ms": round(dev.avg_latency_ms, 1),
+                "io_count": dev.io_count,
+                "io_errors": dev.io_errors,
             })
         return {
             "device_count": len(self._devices),

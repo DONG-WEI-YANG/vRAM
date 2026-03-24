@@ -541,10 +541,12 @@ class RealBoostEngine:
                 "drive_letter": drv,
             })
 
-            # Striped 模式：用可用空間的 80% 直接分配
-            # 個別 speed cap 不再限制 — 因為寫入壓力由所有裝置平行分攤
-            # 總上限由合計速度在最後統一控制
-            wanted = int(usage.free * (use_pct / 100))
+            # Striped 模式：個別裝置 cap 放寬到 2x（平行分攤）
+            # 但不是無限 — 防止單裝置被斷線後壓垮
+            STRIPED_MULTIPLIER = 2.0  # 比單裝置寬鬆 2 倍
+            device_cap = int(effective_speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS * STRIPED_MULTIPLIER)
+            device_cap = max(device_cap, SWAP_MIN_BYTES)
+            wanted = min(int(usage.free * (use_pct / 100)), device_cap)
             swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
             if swap_bytes < 512 * (1024 ** 2):
                 report(f"{drv}: skipped (swap too small)")
