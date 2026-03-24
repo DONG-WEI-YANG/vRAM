@@ -541,13 +541,10 @@ class RealBoostEngine:
                 "drive_letter": drv,
             })
 
-            # 用等效速度計算 swap 上限
-            old_speed = self._measured_rand_write_mbs
-            self._measured_rand_write_mbs = effective_speed
+            # Striped 模式：用可用空間的 80% 直接分配
+            # 個別 speed cap 不再限制 — 因為寫入壓力由所有裝置平行分攤
+            # 總上限由合計速度在最後統一控制
             wanted = int(usage.free * (use_pct / 100))
-            wanted, _ = self._cap_swap_by_speed(wanted)
-            self._measured_rand_write_mbs = old_speed  # restore
-
             swap_bytes = (wanted // (1024 * 1024)) * (1024 * 1024)
             if swap_bytes < 512 * (1024 ** 2):
                 report(f"{drv}: skipped (swap too small)")
@@ -583,13 +580,20 @@ class RealBoostEngine:
         for eng, detail in zip(self._mmap_engines, device_details):
             self._striped.add_device(eng, detail["speed_mbs"])
 
+        # ── 合計速度 cap：用所有裝置的合計速度做總上限 ──
+        striped_speed = self._striped.total_speed_mbs
+        combined_cap = int(striped_speed * (1024 ** 2) * SWAP_FILL_TIME_SECONDS)
+        if total_swap_bytes > combined_cap:
+            logger.info("Striped cap: %.1fGB → %.1fGB (combined %.0f MB/s × %ds)",
+                         total_swap_bytes / (1024**3), combined_cap / (1024**3),
+                         striped_speed, SWAP_FILL_TIME_SECONDS)
+            total_swap_bytes = combined_cap
+
         self._swap_size_bytes = total_swap_bytes
         self._active = True
 
         after_mem = self.get_system_memory()
         total_gb = total_swap_bytes / (1024 ** 3)
-
-        striped_speed = self._striped.total_speed_mbs
 
         return {
             "success": True,
@@ -605,8 +609,8 @@ class RealBoostEngine:
         }
 
     @staticmethod
-    def _benchmark_sequential_write(mount_path: str, size_mb: int = 16) -> float:
-        """順序寫入測速（Write-Back Buffer 的等效速度基準）"""
+    def _benchmark_sequential_write(mount_path: str, size_mb: int = 8) -> float:
+        """順序寫入測速（Write-Back Buffer 的等效速度基準），30 秒 timeout"""
         test_file = Path(mount_path) / ".vram_seq_test"
         chunk = os.urandom(1024 * 1024)  # 1MB
         try:
@@ -614,8 +618,23 @@ class RealBoostEngine:
             with open(test_file, "wb", buffering=0) as f:
                 for _ in range(size_mb):
                     f.write(chunk)
+                    # 逐 MB 檢查 timeout，避免 fsync 卡死
+                    if time.perf_counter() - start > 30:
+                        logger.warning("Sequential write timeout at %s", mount_path)
+                        break
                 f.flush()
-                os.fsync(f.fileno())
+                # fsync 也加 timeout（用 thread）
+                import threading
+                done = threading.Event()
+                def do_sync():
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                    done.set()
+                t = threading.Thread(target=do_sync, daemon=True)
+                t.start()
+                done.wait(timeout=15)  # fsync 最多等 15 秒
             elapsed = time.perf_counter() - start
             return size_mb / elapsed if elapsed > 0 else 0
         except OSError:
