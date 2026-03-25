@@ -418,10 +418,12 @@ class VhdBridge:
                 return False
 
         # 呼叫 CreateVirtualDisk
+        # 注意：Version 2 parameters 必須用 AccessMask=0，
+        # 否則 Win10+ 回傳 ERROR_INVALID_PARAMETER (87)
         ret = self._vdisk.CreateVirtualDisk(
             ctypes.byref(storage_type),     # VirtualStorageType
             path,                           # Path
-            VIRTUAL_DISK_ACCESS_ALL,        # VirtualDiskAccessMask
+            0,                              # VirtualDiskAccessMask (must be 0 for V2)
             None,                           # SecurityDescriptor
             create_flags,                   # Flags
             0,                              # ProviderSpecificFlags
@@ -490,7 +492,7 @@ class VhdBridge:
         ret = self._vdisk.OpenVirtualDisk(
             ctypes.byref(storage_type),     # VirtualStorageType
             path,                           # Path
-            VIRTUAL_DISK_ACCESS_ALL,        # VirtualDiskAccessMask
+            0,                              # VirtualDiskAccessMask (0 for V2)
             OPEN_VIRTUAL_DISK_FLAG_NONE,    # Flags
             ctypes.byref(params),           # Parameters
             ctypes.byref(handle),           # Handle (out)
