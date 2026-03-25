@@ -691,10 +691,15 @@ class VhdPagefileEngine:
         """
         在指定磁碟上建立 Windows pagefile。
 
-        使用 WMI（透過 PowerShell），所有 Windows 版本皆可用。
-        如果 WMI 失敗，嘗試 NtCreatePagingFile fallback。
+        主要方法：NtCreatePagingFile（即時生效，不需重啟）
+        備用方法：WMI via PowerShell（VHD 上可能 timeout）
         """
-        # 方法 1: WMI via PowerShell
+        # 方法 1: NtCreatePagingFile（快速，需要 SeCreatePagefilePrivilege）
+        if self._create_pagefile_ntapi(letter, min_mb, max_mb):
+            return True
+
+        # 方法 2: WMI fallback（較慢，VHD volume 上可能 timeout）
+        logger.info("NtCreatePagingFile failed, trying WMI fallback...")
         ps_script = (
             f"$ErrorActionPreference = 'Stop'; "
             f"$pf = [wmiclass]'Win32_PageFileSetting'; "
@@ -708,7 +713,7 @@ class VhdPagefileEngine:
         try:
             result = _run_hidden(
                 ["powershell", "-NoProfile", "-Command", ps_script],
-                timeout=30,
+                timeout=60,
             )
             if result.returncode == 0:
                 logger.info("Pagefile created via WMI: %s:\\pagefile.sys (%d MB)",
@@ -718,23 +723,25 @@ class VhdPagefileEngine:
                 logger.warning("WMI pagefile creation failed (rc=%d): %s",
                                result.returncode, result.stderr or result.stdout)
         except subprocess.TimeoutExpired:
-            logger.warning("WMI pagefile creation timeout")
+            logger.warning("WMI pagefile creation timeout (60s)")
         except OSError as e:
             logger.warning("WMI pagefile creation error: %s", e)
 
-        # 方法 2: NtCreatePagingFile fallback（直接呼叫 NT API）
-        return self._create_pagefile_ntapi(letter, min_mb, max_mb)
+        return False
 
     def _create_pagefile_ntapi(self, letter: str, min_mb: int, max_mb: int) -> bool:
         """
         使用 NtCreatePagingFile NT API 建立 pagefile（WMI 失敗時的 fallback）。
 
         NtCreatePagingFile 可以在非系統磁碟上直接建立 pagefile，
-        不需要重啟，但需要管理員權限。
+        不需要重啟，但需要管理員權限 + SeCreatePagefilePrivilege。
         """
         try:
             import ctypes
             from ctypes import wintypes
+
+            # ── 啟用 SeCreatePagefilePrivilege ──
+            self._enable_pagefile_privilege()
 
             ntdll = ctypes.WinDLL("ntdll")
 
@@ -795,6 +802,42 @@ class VhdPagefileEngine:
         except (OSError, AttributeError, ImportError) as e:
             logger.warning("NtCreatePagingFile fallback error: %s", e)
             return False
+
+    @staticmethod
+    def _enable_pagefile_privilege():
+        """啟用 SeCreatePagefilePrivilege（NtCreatePagingFile 必要）。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+            class LUID(ctypes.Structure):
+                _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", ctypes.c_long)]
+            class LUID_AND_ATTRIBUTES(ctypes.Structure):
+                _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+            class TOKEN_PRIVILEGES(ctypes.Structure):
+                _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                             ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+            hToken = wintypes.HANDLE()
+            advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x0028, ctypes.byref(hToken))
+            luid = LUID()
+            advapi32.LookupPrivilegeValueW(
+                None, "SeCreatePagefilePrivilege", ctypes.byref(luid))
+            tp = TOKEN_PRIVILEGES()
+            tp.PrivilegeCount = 1
+            tp.Privileges[0].Luid = luid
+            tp.Privileges[0].Attributes = 0x00000002  # SE_PRIVILEGE_ENABLED
+            advapi32.AdjustTokenPrivileges(
+                hToken, False, ctypes.byref(tp), 0, None, None)
+            kernel32.CloseHandle(hToken)
+            logger.debug("SeCreatePagefilePrivilege enabled")
+        except Exception as e:
+            logger.warning("Failed to enable SeCreatePagefilePrivilege: %s", e)
 
     def _remove_pagefile_on_volume(self, letter: str) -> bool:
         """
