@@ -4,13 +4,17 @@ Linux Multi-Device Swap Engine
 在多個外接裝置上建立 swap file，透過 swapon -p 同優先級平行 I/O。
 
 Linux 不需要 VHD 繞路：
-  swapon -p 10 /mnt/sd1/vram_boost.swap   # SD card 1
-  swapon -p 10 /mnt/sd2/vram_boost.swap   # SD card 2
-  swapon -p 10 /mnt/usb/vram_boost.swap   # USB drive
+  swapon -p -1 /mnt/sd1/vram_boost.swap   # SD card 1
+  swapon -p -1 /mnt/sd2/vram_boost.swap   # SD card 2
+  swapon -p -1 /mnt/usb/vram_boost.swap   # USB drive
   → kernel round-robin across all → 合計頻寬 ≈ 各裝置之和
   → 所有程式自動受益（kernel-level swap）
 
-與 Windows VHD Bridge 等效但無需任何 workaround。
+安全策略（與 Windows VHD 版一致）：
+  - 低優先級 (-1)：比系統內建 swap 低，溢出時才使用外接
+  - 拔卡時外接 swap 上幾乎無 active pages → 安全
+  - get_swap_usage() 可查詢 /proc/swaps 確認是否 safe_to_remove
+  - safe_remove_device() 先 swapoff（kernel 遷移 pages）再安全移除
 """
 
 from __future__ import annotations
@@ -120,7 +124,11 @@ class LinuxSwapEngine:
     SWAP_FILENAME = "vram_boost.swap"
     SWAP_FILL_TIME_SECONDS = SWAP_FILL_TIME_SECONDS
     SWAP_MIN_BYTES = SWAP_MIN_BYTES
-    SWAP_PRIORITY = 10  # 同優先級 = round-robin 平行 I/O
+    # Linux swap priority: 高數字 = 優先使用
+    # 系統預設 swap (C:\ 等效) 通常 priority >= 0
+    # 我們設 -1 → 比系統低 → 溢出時才用外接
+    # 多個外接裝置之間用相同 priority → 彼此 round-robin
+    SWAP_PRIORITY = -1  # 比系統低，溢出時才使用
 
     def __init__(self):
         self._devices: List[SwapDevice] = []
@@ -147,7 +155,7 @@ class LinuxSwapEngine:
           4. 檢查是否可重用既有 swap 檔案
           5. 建立 swap 檔案 (fallocate 或 dd)
           6. mkswap + chmod 600
-          7. swapon -p SWAP_PRIORITY (同優先級 = 平行 I/O)
+          7. swapon -p SWAP_PRIORITY (低優先級 = 溢出時才用外接)
           8. 啟動監控執行緒
 
         Args:
@@ -322,6 +330,7 @@ class LinuxSwapEngine:
         with self._lock:
             devices_info = []
             for dev in self._devices:
+                usage = self.get_swap_usage(dev.swap_path)
                 devices_info.append({
                     "mount_point": dev.mount_point,
                     "swap_path": dev.swap_path,
@@ -330,6 +339,8 @@ class LinuxSwapEngine:
                     "active": dev.active,
                     "degraded": dev.degraded,
                     "reused": dev.reused,
+                    "used_kb": usage["used_kb"],
+                    "safe_to_remove": usage["safe_to_remove"],
                 })
 
             total_bytes = sum(d.size_bytes for d in self._devices)
@@ -350,6 +361,90 @@ class LinuxSwapEngine:
                 "priority": self.SWAP_PRIORITY,
                 "devices": devices_info,
             }
+
+    # ── 安全移除 ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_swap_usage(swap_path: str) -> Dict[str, int]:
+        """
+        查詢指定 swap 檔案的使用狀況。
+
+        讀取 /proc/swaps 解析。
+
+        Returns:
+            {"size_kb": N, "used_kb": N, "safe_to_remove": bool}
+        """
+        try:
+            with open("/proc/swaps") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == swap_path:
+                        size_kb = int(parts[2])
+                        used_kb = int(parts[3])
+                        return {
+                            "size_kb": size_kb,
+                            "used_kb": used_kb,
+                            "safe_to_remove": used_kb == 0,
+                        }
+        except (OSError, ValueError) as e:
+            logger.debug("Swap usage query failed for %s: %s", swap_path, e)
+
+        return {"size_kb": 0, "used_kb": 0, "safe_to_remove": True}
+
+    def safe_remove_device(self, mount_point: str,
+                           on_progress=None) -> Dict[str, Any]:
+        """
+        安全移除指定裝置的 swap。
+
+        流程：
+        1. 檢查 swap 使用量
+        2. swapoff（kernel 會自動遷移 pages 回 RAM 或其他 swap）
+        3. 回報安全可拔裝置
+        """
+        report = on_progress or (lambda msg: logger.info(msg))
+
+        with self._lock:
+            dev = None
+            for d in self._devices:
+                if d.mount_point == mount_point:
+                    dev = d
+                    break
+
+        if dev is None:
+            return {"success": False, "safe_to_remove": False,
+                    "message": f"Device {mount_point}: not found"}
+
+        # 檢查使用量
+        usage = self.get_swap_usage(dev.swap_path)
+        report(f"{mount_point}: swap usage = {usage['used_kb']} KB")
+
+        # swapoff（kernel 自動遷移 active pages）
+        if dev.active:
+            report(f"{mount_point}: swapoff (kernel migrating pages)...")
+            try:
+                r = subprocess.run(
+                    ["swapoff", dev.swap_path],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if r.returncode == 0:
+                    dev.active = False
+                    report(f"{mount_point}: swap removed, safe to eject")
+                else:
+                    report(f"{mount_point}: swapoff failed: {r.stderr.strip()}")
+                    return {"success": False, "safe_to_remove": False,
+                            "message": f"swapoff failed: {r.stderr.strip()}"}
+            except subprocess.TimeoutExpired:
+                report(f"{mount_point}: swapoff timeout (60s)")
+                return {"success": False, "safe_to_remove": False,
+                        "message": "swapoff timeout"}
+
+        # 從 device list 移除
+        with self._lock:
+            if dev in self._devices:
+                self._devices.remove(dev)
+
+        return {"success": True, "safe_to_remove": True,
+                "message": f"Device {mount_point}: safely ejected"}
 
     # ── 單裝置設定 ────────────────────────────────────────────────────
 

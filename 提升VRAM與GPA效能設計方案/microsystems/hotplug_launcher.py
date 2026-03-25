@@ -108,6 +108,30 @@ def get_my_drive() -> Optional[str]:
     return None
 
 
+def detect_mode() -> str:
+    """
+    偵測運行模式：
+    - "device": exe 在外接裝置上（現有行為）
+    - "host": exe 在系統碟上（主機模式）
+    """
+    drive = get_my_drive()
+    if drive is None:
+        return "host"  # 無法辨識外接磁碟 → 視為主機模式
+
+    # 檢查 exe 所在磁碟是否為系統碟
+    if platform.system().lower() == "windows":
+        sys_drive = os.environ.get("SystemDrive", "C:")[0].upper()
+        if drive.upper() == sys_drive:
+            return "host"
+    else:
+        # Linux: 如果在 /usr, /opt, /home 等系統路徑 → host mode
+        exe_path = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+        if not exe_path.startswith(("/mnt/", "/media/", "/run/media/")):
+            return "host"
+
+    return "device"
+
+
 def detect_device_type(letter: str) -> Dict[str, Any]:
     """
     偵測指定磁碟是什麼裝置。
@@ -825,8 +849,19 @@ def main():
             _elevate_linux()
         sys.exit(0)
 
-    app = BoosterApp()
-    app.run()
+    mode = detect_mode()
+    logger.info("Running in %s mode", mode)
+
+    if mode == "host":
+        # 主機模式：使用 Host UI
+        from .host_ui import HostUI
+        logger.info("Launching Host Mode UI...")
+        app = HostUI()
+        app.run()
+    else:
+        # 裝置模式：使用原有的 BoosterApp
+        app = BoosterApp()
+        app.run()
 
 
 if __name__ == "__main__":

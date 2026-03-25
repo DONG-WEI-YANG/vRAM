@@ -42,6 +42,11 @@ SWAP_MIN_BYTES = 512 * (1024 ** 2)  # 最小 512 MB
 
 _MONITOR_INTERVAL: float = 10.0  # 背景監控間隔（秒）
 
+# 安全策略：pagefile min 設很小，讓 Windows 優先用 C:\ 的快速 pagefile
+# 只有在 C:\ pagefile 壓力大時才溢出到外接裝置
+# 這樣拔卡時外接 pagefile 上幾乎沒有 active pages → 安全
+PAGEFILE_MIN_MB = 16  # 16MB — 最小佔用，幾乎不會被主動使用
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -314,6 +319,7 @@ class VhdPagefileEngine:
             any_degraded = False
 
             for dev in self._devices:
+                pf_usage = self.get_pagefile_usage(dev.mount_letter) if dev.pagefile_active else {}
                 devices.append({
                     "drive": dev.drive_letter,
                     "mount": dev.mount_letter,
@@ -323,6 +329,8 @@ class VhdPagefileEngine:
                     "pagefile_active": dev.pagefile_active,
                     "degraded": dev.degraded,
                     "disk_number": dev.disk_number,
+                    "pagefile_usage_mb": pf_usage.get("current_usage_mb", 0),
+                    "safe_to_remove": pf_usage.get("safe_to_remove", True),
                 })
                 if not dev.degraded:
                     total_bytes += dev.swap_bytes
@@ -336,6 +344,122 @@ class VhdPagefileEngine:
                 "total_swap_gb": round(total_bytes / (1024 ** 3), 1),
                 "degraded": any_degraded,
             }
+
+    # ── Pagefile Usage Monitoring ─────────────────────────────────────
+
+    @staticmethod
+    def get_pagefile_usage(letter: str) -> Dict[str, int]:
+        """
+        查詢指定磁碟上 pagefile 的使用狀況。
+
+        Returns:
+            {
+                "allocated_mb": total allocated size,
+                "current_usage_mb": currently in-use pages,
+                "peak_usage_mb": peak usage since boot,
+                "safe_to_remove": True if current_usage == 0,
+            }
+        """
+        try:
+            import subprocess
+            pf_path = f"{letter}:\\pagefile.sys"
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-CimInstance Win32_PageFileUsage | "
+                 f"Where-Object {{ $_.Name -eq '{pf_path}' }} | "
+                 f"Select-Object AllocatedBaseSize, CurrentUsage, PeakUsage | "
+                 f"ConvertTo-Json"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                import json
+                data = json.loads(r.stdout)
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                return {
+                    "allocated_mb": data.get("AllocatedBaseSize", 0),
+                    "current_usage_mb": data.get("CurrentUsage", 0),
+                    "peak_usage_mb": data.get("PeakUsage", 0),
+                    "safe_to_remove": data.get("CurrentUsage", 0) == 0,
+                }
+        except Exception as e:
+            logger.warning("Pagefile usage query failed for %s: %s", letter, e)
+
+        return {"allocated_mb": 0, "current_usage_mb": 0, "peak_usage_mb": 0, "safe_to_remove": True}
+
+    # ── Safe Device Removal ────────────────────────────────────────────
+
+    def safe_remove_device(self, drive_letter: str,
+                           on_progress=None) -> Dict[str, Any]:
+        """
+        安全移除指定裝置的 VHD pagefile。
+
+        流程：
+        1. 檢查 pagefile 使用量
+        2. 如果有 active pages → 移除 pagefile（讓 Windows 遷移 pages 回 C:\）
+        3. 等待 pagefile 使用量降為 0
+        4. Detach VHD
+        5. 回報安全可拔卡
+
+        Returns:
+            {"success": bool, "safe_to_remove": bool, "message": str}
+        """
+        report = on_progress or (lambda msg: logger.info(msg))
+
+        with self._lock:
+            dev = None
+            for d in self._devices:
+                if d.drive_letter == drive_letter:
+                    dev = d
+                    break
+
+        if dev is None:
+            return {"success": False, "safe_to_remove": False,
+                    "message": f"Device {drive_letter}: not found"}
+
+        # Step 1: 檢查 pagefile 使用量
+        usage = self.get_pagefile_usage(dev.mount_letter)
+        report(f"{drive_letter}: pagefile usage = {usage['current_usage_mb']} MB")
+
+        # Step 2: 移除 pagefile（讓 Windows 遷移 pages）
+        if dev.pagefile_active:
+            report(f"{drive_letter}: removing pagefile (Windows will migrate pages to C:\\)...")
+            self._remove_pagefile_on_volume(dev.mount_letter)
+            dev.pagefile_active = False
+
+        # Step 3: 等待使用量降為 0（最多 30 秒）
+        for i in range(30):
+            usage = self.get_pagefile_usage(dev.mount_letter)
+            if usage["safe_to_remove"]:
+                break
+            report(f"{drive_letter}: waiting for pages to migrate... ({usage['current_usage_mb']} MB remaining)")
+            time.sleep(1)
+
+        if not usage["safe_to_remove"]:
+            report(f"{drive_letter}: WARNING - {usage['current_usage_mb']} MB still in use, forced removal")
+
+        # Step 4: Detach VHD
+        report(f"{drive_letter}: detaching VHD...")
+        try:
+            dev.bridge.detach()
+            dev.bridge.close()
+        except Exception as e:
+            logger.warning("VHD detach error for %s: %s", drive_letter, e)
+
+        # Step 5: 從 device list 移除
+        with self._lock:
+            if dev in self._devices:
+                self._devices.remove(dev)
+            self._release_letter(dev.mount_letter)
+
+        report(f"{drive_letter}: safe to remove")
+        return {
+            "success": True,
+            "safe_to_remove": True,
+            "message": f"Device {drive_letter}: safely ejected",
+            "remaining_usage_mb": usage.get("current_usage_mb", 0),
+        }
 
     # ── Drive Letter Management ────────────────────────────────────────
 
@@ -474,7 +598,7 @@ class VhdPagefileEngine:
         # Step 6: 建立 pagefile
         swap_mb = swap_bytes // (1024 * 1024)
         report(f"{drive_letter}: 建立 pagefile ({swap_mb} MB) on {mount_letter}:...")
-        pf_ok = self._create_pagefile_on_volume(mount_letter, swap_mb, swap_mb)
+        pf_ok = self._create_pagefile_on_volume(mount_letter, PAGEFILE_MIN_MB, swap_mb)
 
         dev = VhdPagefileDevice(
             drive_letter=drive_letter,
@@ -576,7 +700,7 @@ class VhdPagefileEngine:
             f"$pf = [wmiclass]'Win32_PageFileSetting'; "
             f"$new = $pf.CreateInstance(); "
             f"$new.Name = '{letter}:\\pagefile.sys'; "
-            f"$new.InitialSize = {min_mb}; "
+            f"$new.InitialSize = {PAGEFILE_MIN_MB}; "
             f"$new.MaximumSize = {max_mb}; "
             f"$new.Put()"
         )
@@ -819,7 +943,7 @@ class VhdPagefileEngine:
 
             # 重新建立 pagefile
             swap_mb = dev.swap_bytes // (1024 * 1024)
-            pf_ok = self._create_pagefile_on_volume(dev.mount_letter, swap_mb, swap_mb)
+            pf_ok = self._create_pagefile_on_volume(dev.mount_letter, PAGEFILE_MIN_MB, swap_mb)
             with self._lock:
                 dev.pagefile_active = pf_ok
 

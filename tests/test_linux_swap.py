@@ -33,7 +33,7 @@ class TestLinuxSwapEngine(unittest.TestCase):
         from microsystems.core.linux_swap import LinuxSwapEngine
         self.assertEqual(LinuxSwapEngine.SWAP_FILENAME, "vram_boost.swap")
         self.assertEqual(LinuxSwapEngine.SWAP_FILL_TIME_SECONDS, 600)
-        self.assertGreater(LinuxSwapEngine.SWAP_PRIORITY, 0)
+        self.assertEqual(LinuxSwapEngine.SWAP_PRIORITY, -1)  # 低於系統預設，溢出時才用
 
     def test_deactivate_when_not_active(self):
         """Deactivating when not active should be safe."""
