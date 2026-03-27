@@ -188,7 +188,8 @@ class TestValidation(unittest.TestCase):
         self.assertIn("max", reason.lower())
 
     def test_reject_insufficient_device_space(self):
-        ok, reason = SafetyPolicy.validate_activation(64.0, 62.0, self.policy)
+        # capacity=28, requested=25 → only 3 GB left, but 4 GB reserved
+        ok, reason = SafetyPolicy.validate_activation(28.0, 25.0, self.policy)
         self.assertFalse(ok)
         self.assertIn("reserved", reason.lower())
 
