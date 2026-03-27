@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Callable
 
 from .mmap_engine import MmapSwapEngine
+from .safety_policy import SafetyPolicy, GLOBAL_POLICY_PATH
 from .striped_swap import StripedSwapScheduler
 from .vhd_pagefile import VhdPagefileEngine
 
@@ -261,6 +262,35 @@ class RealBoostEngine:
 
         # 計算 swap 大小
         report("計算最佳 swap 大小...")
+
+        # ── Safety Policy validation ──
+        try:
+            capacity_gb = shutil.disk_usage(mount).total / (1024 ** 3)
+            device_config_path = Path(mount) / self.CONFIG_FILENAME
+            policy = SafetyPolicy.load_merged_policy(
+                GLOBAL_POLICY_PATH, device_config_path,
+                capacity_gb=capacity_gb,
+                speed_mbs=self._measured_rand_write_mbs,
+            )
+
+            # Clamp requested size to policy limits
+            requested_gb = capacity_gb * (use_percent / 100)
+            requested_gb = min(requested_gb, policy.pagefile_max_gb)
+            requested_gb = max(requested_gb, policy.pagefile_min_gb)
+
+            ok, reason = SafetyPolicy.validate_activation(
+                capacity_gb, requested_gb, policy)
+            if not ok:
+                logger.warning("Safety policy rejected activation: %s", reason)
+                report(f"Policy rejected: {reason}")
+                return {"success": False, "error": f"Safety policy: {reason}"}
+
+            # Recalculate use_percent from clamped value
+            use_percent = (requested_gb / capacity_gb) * 100
+            report(f"Safety policy: {requested_gb:.1f} GB "
+                   f"(reserve {policy.device_reserved_gb:.0f} GB on device)")
+        except Exception as e:
+            logger.warning("Safety policy check skipped: %s", e)
 
         if self._is_windows:
             result = self._activate_windows(drive_letter, use_percent, report)
