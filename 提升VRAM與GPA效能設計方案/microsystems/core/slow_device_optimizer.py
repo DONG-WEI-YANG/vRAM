@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import struct
 import threading
 import time
@@ -94,6 +95,33 @@ class BufferedBlock:
     dirty: bool = True
     last_access: float = field(default_factory=time.time)
     access_count: int = 0
+
+
+def detect_device_speed(path: str, test_size_mb: int = 4) -> float:
+    """
+    偵測裝置的寫入速度 (MB/s)。
+
+    寫入 test_size_mb MB 的測試資料，測量耗時。
+    回傳 MB/s；若失敗回傳 0.0。
+    """
+    import tempfile
+    test_data = os.urandom(test_size_mb * 1024 * 1024)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=path, prefix=".vram_speedtest_")
+        try:
+            t0 = time.perf_counter()
+            os.write(fd, test_data)
+            os.fsync(fd)
+            elapsed = time.perf_counter() - t0
+            speed = test_size_mb / max(elapsed, 0.001)
+            logger.info("Device speed test: %s → %.1f MB/s", path, speed)
+            return speed
+        finally:
+            os.close(fd)
+            os.unlink(tmp_path)
+    except (OSError, PermissionError) as e:
+        logger.warning("Speed test failed for %s: %s", path, e)
+        return 0.0
 
 
 class SlowDeviceOptimizer:
@@ -155,6 +183,46 @@ class SlowDeviceOptimizer:
             compression.value, quantization.value,
             buffer_size_mb, sequential_block_kb,
         )
+
+    @classmethod
+    def for_device_speed(cls, speed_mbs: float) -> "SlowDeviceOptimizer":
+        """
+        根據裝置速度自動選擇最佳參數。
+
+        <10 MB/s (Class 4 SD):  最激進壓縮 + 大 buffer + 量化
+        10-50 MB/s (USB 3.0):   標準壓縮 + 中等 buffer
+        50-200 MB/s (SSD):      快速壓縮 + 小 buffer
+        >200 MB/s (NVMe):       不壓縮，最小 buffer
+        """
+        if speed_mbs < 10:
+            return cls(
+                compression=CompressionMethod.ZLIB_FAST,
+                quantization=QuantizationLevel.INT8,
+                buffer_size_mb=512,
+                sequential_block_kb=2048,
+                max_buffer_entries=2048,
+            )
+        elif speed_mbs < 50:
+            return cls(
+                compression=CompressionMethod.ZLIB_FAST,
+                quantization=QuantizationLevel.NONE,
+                buffer_size_mb=256,
+                sequential_block_kb=1024,
+            )
+        elif speed_mbs < 200:
+            return cls(
+                compression=CompressionMethod.LZ4,
+                quantization=QuantizationLevel.NONE,
+                buffer_size_mb=128,
+                sequential_block_kb=512,
+            )
+        else:
+            return cls(
+                compression=CompressionMethod.NONE,
+                quantization=QuantizationLevel.NONE,
+                buffer_size_mb=64,
+                sequential_block_kb=256,
+            )
 
     # ── Public API ──
 
@@ -332,6 +400,10 @@ class SlowDeviceOptimizer:
 
     # ── Compression ──
 
+    # Compression markers: distinguish compressed vs raw in read path
+    _MARKER_RAW = b"\xFE"        # data was not compressed (incompressible)
+    _MARKER_COMPRESSED = b"\xFD"  # data was compressed with standard method
+
     def _compress(self, data: bytes) -> bytes:
         if self._compression == CompressionMethod.NONE:
             return data
@@ -347,27 +419,47 @@ class SlowDeviceOptimizer:
 
         self._stats.total_compress_ms += (time.perf_counter() - start) * 1000
 
-        # 如果壓縮後反而更大，就不壓縮
+        # 如果壓縮後反而更大，標記為 raw 以避免讀取端嘗試解壓
         if len(result) >= len(data):
-            return data
+            return self._MARKER_RAW + data
 
-        return result
+        return self._MARKER_COMPRESSED + result
 
     def _decompress(self, data: bytes) -> bytes:
         if self._compression == CompressionMethod.NONE:
             return data
+        if not data or len(data) < 2:
+            return data
 
         start = time.perf_counter()
+        marker = data[0:1]
+        payload = data[1:]
 
         try:
-            if self._compression == CompressionMethod.LZ4 and HAS_LZ4:
-                result = lz4f.decompress(data)
-            elif self._compression == CompressionMethod.ZLIB_FAST:
-                result = zlib.decompress(data)
+            # Dispatch by marker byte
+            if marker == self._MARKER_RAW:
+                # Was incompressible — return payload as-is
+                result = payload
+            elif self._dict_trained and marker in (b"\x00", b"\x01"):
+                # MLA SharedCompressionDict markers: 0x00=standard, 0x01=dict
+                result = self._shared_dict.decompress(data)
+            elif marker == self._MARKER_COMPRESSED:
+                # Standard compression
+                if self._compression == CompressionMethod.LZ4 and HAS_LZ4:
+                    result = lz4f.decompress(payload)
+                elif self._compression == CompressionMethod.ZLIB_FAST:
+                    result = zlib.decompress(payload)
+                else:
+                    result = payload
             else:
-                result = data
+                # Legacy data without marker — try direct decompression
+                if self._compression == CompressionMethod.LZ4 and HAS_LZ4:
+                    result = lz4f.decompress(data)
+                elif self._compression == CompressionMethod.ZLIB_FAST:
+                    result = zlib.decompress(data)
+                else:
+                    result = data
         except (zlib.error, Exception):
-            # 可能是未壓縮的資料
             result = data
 
         self._stats.total_decompress_ms += (time.perf_counter() - start) * 1000

@@ -66,6 +66,7 @@ class StripedSwapScheduler:
         self._grouped_scheduler = GroupedBlockScheduler(min_co_access=3)
         self._gqa_access_count = 0
         self._gqa_flush_interval = 20
+        self._gqa_detect_interval = 100  # detect groups every 100 accesses
 
     def add_device(self, engine: Any, speed_mbs: float) -> int:
         """加入一個裝置到 stripe group，回傳 device index。"""
@@ -113,20 +114,25 @@ class StripedSwapScheduler:
         快裝置分到更多 block（負載平衡）。
         """
         with self._lock:
-            # 選最「空閒」的裝置（已分配 / 權重 最小的）
-            # 節流中的裝置降低優先級但不完全跳過（避免其他裝置也壓力過大）
+            # 選最「空閒」的裝置 — 使用 bandwidth-aware 平衡
+            # 考慮實際 I/O 負載（avg_latency）而非僅看 block count
             best = None
-            best_ratio = float('inf')
+            best_score = float('inf')
             for i, dev in enumerate(self._devices):
                 if dev.allocated_blocks >= dev.total_blocks:
                     continue  # 滿了
                 if dev.weight <= 0:
                     continue
-                ratio = dev.allocated_blocks / dev.weight
+                # 基礎分數：已分配 / 權重
+                score = dev.allocated_blocks / dev.weight
+                # 動態調整：延遲高的裝置降低優先級
+                if dev.avg_latency_ms > 0 and dev.io_count > 5:
+                    latency_penalty = dev.avg_latency_ms / 100.0  # 每 100ms 加 1x
+                    score *= (1.0 + latency_penalty)
                 if dev.throttled:
-                    ratio *= 10  # 節流裝置排到最後
-                if ratio < best_ratio:
-                    best_ratio = ratio
+                    score *= 10  # 節流裝置排到最後
+                if score < best_score:
+                    best_score = score
                     best = i
 
             if best is None:
@@ -163,6 +169,8 @@ class StripedSwapScheduler:
         self._gqa_access_count += 1
         if self._gqa_access_count % self._gqa_flush_interval == 0:
             self._grouped_scheduler.flush_window()
+        if self._gqa_access_count % self._gqa_detect_interval == 0:
+            self.detect_block_groups()
         dev = self._devices[block.device_idx]
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
@@ -184,6 +192,8 @@ class StripedSwapScheduler:
         self._gqa_access_count += 1
         if self._gqa_access_count % self._gqa_flush_interval == 0:
             self._grouped_scheduler.flush_window()
+        if self._gqa_access_count % self._gqa_detect_interval == 0:
+            self.detect_block_groups()
         dev = self._devices[block.device_idx]
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
@@ -281,6 +291,28 @@ class StripedSwapScheduler:
                 thread_name_prefix="stripe-io",
             )
         return self._pool
+
+    def read_group_aware(self, logical_id: int, size: int = -1) -> List[Optional[bytes]]:
+        """
+        GQA 感知讀取：讀取目標 block 及其 group 內的所有 block。
+
+        若 block 屬於某個 co-access group，一次性預讀整組，
+        利用同裝置順序讀取優勢，減少後續 I/O 次數。
+        """
+        bid = str(logical_id)
+        group_plan = self._grouped_scheduler.get_group_io_plan(bid)
+        if len(group_plan) <= 1:
+            # No group — single read
+            data = self.read(logical_id, 0, size)
+            return [data]
+        # Parallel read all group members
+        group_ids = []
+        for member_bid in group_plan:
+            try:
+                group_ids.append(int(member_bid))
+            except (ValueError, TypeError):
+                continue
+        return self.read_parallel(group_ids, size)
 
     def detect_block_groups(self) -> list:
         """觸發 GQA block group 偵測並更新裝置親和性。"""

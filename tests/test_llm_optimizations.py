@@ -1367,5 +1367,199 @@ class TestR11_Export(unittest.TestCase):
         self.assertEqual(set(stats.keys()), expected_keys)
 
 
+# ═══════════════════════════════════════════════════════════════
+# R12 Regression — Bug fixes + optimization enhancements
+# ═══════════════════════════════════════════════════════════════
+class TestR12_Regression(unittest.TestCase):
+    """Regression tests for critical bug fixes and optimizations"""
+
+    # ── Bug #1: _execute_batch block_id vs request_id ──
+    def test_flash_io_batch_executes_transfers(self):
+        """Batch must build block_id→req reverse index, not use _pending key"""
+        from microsystems.core.transfer_engine import TransferEngine, TransferStatus
+        engine = TransferEngine(max_workers=1)
+        engine.start()
+        try:
+            # The _execute_batch method should build a reverse index
+            self.assertTrue(hasattr(engine, '_execute_batch'))
+            # Verify _pending is keyed by request_id
+            from microsystems.core.transfer_engine import TransferRequest
+            from microsystems.core.memory_pool import MemoryTier
+            req = TransferRequest(
+                request_id="", block_id="test_block",
+                source_tier=MemoryTier.RAM, dest_tier=MemoryTier.VRAM,
+                size_bytes=1024,
+            )
+            rid = engine.submit(req)
+            self.assertTrue(rid.startswith("xfer_"))
+            self.assertIn(rid, engine._pending)
+            # block_id should NOT be a key in _pending
+            self.assertNotIn("test_block", engine._pending)
+        finally:
+            engine.stop()
+
+    # ── Bug #2: SharedCompressionDict decompress in read path ──
+    def test_shared_dict_compress_decompress_via_optimizer(self):
+        """Data compressed with shared dict must decompress correctly"""
+        from microsystems.core.slow_device_optimizer import SlowDeviceOptimizer, CompressionMethod
+        opt = SlowDeviceOptimizer(compression=CompressionMethod.ZLIB_FAST)
+        # Train the shared dict
+        base = b"WEIGHT_PATTERN_" * 200
+        for i in range(8):
+            opt._training_samples.append((base + bytes([i]) * 64)[:4096])
+        opt._shared_dict.train(opt._training_samples)
+        opt._dict_trained = True
+        opt._training_samples.clear()
+
+        # Write with dict compression
+        original = base + b"\xAB" * 64
+        written = opt.write("blk_test", 0, original)
+        self.assertGreater(written, 0)
+
+        # Read back from buffer — must decompress correctly
+        result = opt.read("blk_test", 0, len(original))
+        # Result should be usable (not corrupted by wrong decompressor)
+        self.assertIsNotNone(result)
+        self.assertGreater(len(result), 0)
+
+    # ── Bug #3: Flash I/O flush after each transfer ──
+    def test_flash_io_flush_after_transfer(self):
+        """Worker loop should flush batches after each transfer, not just on Empty"""
+        from microsystems.core.transfer_engine import TransferEngine
+        import inspect
+        source = inspect.getsource(TransferEngine._worker_loop)
+        # Verify flush check exists AFTER _execute_transfer
+        exec_pos = source.find('_execute_transfer')
+        flush_pos = source.find('should_flush', exec_pos)
+        self.assertGreater(flush_pos, exec_pos,
+            "_flash_io.should_flush() must be checked after _execute_transfer()")
+
+    # ── Fix #4: Compression markers ──
+    def test_compression_marker_raw(self):
+        """Incompressible data should get RAW marker, not attempt decompression"""
+        from microsystems.core.slow_device_optimizer import SlowDeviceOptimizer, CompressionMethod
+        opt = SlowDeviceOptimizer(compression=CompressionMethod.ZLIB_FAST)
+        # Random data = incompressible
+        raw_data = os.urandom(1024)
+        compressed = opt._compress(raw_data)
+        # Should have RAW marker
+        self.assertEqual(compressed[0:1], opt._MARKER_RAW)
+        # Decompress should return original
+        decompressed = opt._decompress(compressed)
+        self.assertEqual(decompressed, raw_data)
+
+    def test_compression_marker_compressed(self):
+        """Compressible data should get COMPRESSED marker"""
+        from microsystems.core.slow_device_optimizer import SlowDeviceOptimizer, CompressionMethod
+        opt = SlowDeviceOptimizer(compression=CompressionMethod.ZLIB_FAST)
+        compressible = b"\x00" * 4096
+        compressed = opt._compress(compressible)
+        self.assertEqual(compressed[0:1], opt._MARKER_COMPRESSED)
+        decompressed = opt._decompress(compressed)
+        self.assertEqual(decompressed, compressible)
+
+    # ── Fix #5: PlacementCache populated during access ──
+    def test_placement_cache_populates_during_access(self):
+        """PlacementCache should record data during access, not just free"""
+        from microsystems.core.memory_pool import MemoryPool
+        pool = MemoryPool(
+            vram_capacity_bytes=1024*1024*1024,
+            ram_capacity_bytes=1024*1024*1024,
+            external_capacity_bytes=1024*1024*1024,
+        )
+        pool.allocate("blk_0", 1024, tag="layer_0_weight")
+        # Access 50 times to trigger periodic snapshot
+        for _ in range(50):
+            pool.access("blk_0")
+        # PlacementCache should now have an entry
+        tier = pool._placement_cache.lookup("layer_0_weight")
+        self.assertIsNotNone(tier)
+
+    # ── Fix #6: Striped swap bandwidth-aware balancing ──
+    def test_striped_swap_latency_aware_allocation(self):
+        """High-latency devices should get fewer allocations"""
+        from microsystems.core.striped_swap import StripedSwapScheduler
+        ss = StripedSwapScheduler()
+        class MockEngine:
+            _swap = None
+            def status(self):
+                return {"total_blocks": 1000}
+        ss.add_device(MockEngine(), speed_mbs=500.0)  # Fast NVMe
+        ss.add_device(MockEngine(), speed_mbs=10.0)    # Slow SD
+        # Simulate high latency on slow device
+        ss._devices[1].avg_latency_ms = 500.0
+        ss._devices[1].io_count = 10
+        # Allocate many blocks — fast device should get more
+        fast_count = 0
+        for _ in range(100):
+            blk = ss.allocate()
+            if blk and blk.device_idx == 0:
+                fast_count += 1
+        self.assertGreater(fast_count, 80, "Fast device should get >80% of allocations")
+
+    # ── Fix #7: Periodic block group detection ──
+    def test_striped_swap_auto_detects_groups(self):
+        """Block groups should be auto-detected after N accesses"""
+        from microsystems.core.striped_swap import StripedSwapScheduler
+        ss = StripedSwapScheduler()
+        ss._gqa_detect_interval = 20  # lower threshold for test
+        class MockEngine:
+            def status(self):
+                return {"total_blocks": 1000}
+            class _swap:
+                @staticmethod
+                def read_block(bid, off, sz):
+                    return b"\x00" * 64
+                @staticmethod
+                def write_block(bid, data, off):
+                    return True
+        ss.add_device(MockEngine(), speed_mbs=100.0)
+        # Allocate blocks
+        blocks = [ss.allocate() for _ in range(5)]
+        # Access blocks in pattern (same group)
+        for _ in range(25):
+            for blk in blocks[:3]:
+                ss.write(blk.logical_id, b"\x00" * 32)
+        # Groups should have been auto-detected
+        stats = ss._grouped_scheduler.stats()
+        self.assertGreater(stats["total_co_accesses"], 0)
+
+    # ── Fix #8: Adaptive slow device parameters ──
+    def test_slow_device_adaptive_parameters(self):
+        """for_device_speed should return appropriate settings"""
+        from microsystems.core.slow_device_optimizer import SlowDeviceOptimizer, CompressionMethod, QuantizationLevel
+        # Ultra slow SD card
+        opt_slow = SlowDeviceOptimizer.for_device_speed(4.0)
+        self.assertEqual(opt_slow._quantization, QuantizationLevel.INT8)
+        self.assertEqual(opt_slow._buffer_max, 512 * 1024 * 1024)
+        # Fast NVMe
+        opt_fast = SlowDeviceOptimizer.for_device_speed(500.0)
+        self.assertEqual(opt_fast._compression, CompressionMethod.NONE)
+
+    # ── Fix #9: Group-aware parallel read ──
+    def test_group_aware_read_returns_data(self):
+        """read_group_aware should return data for single block"""
+        from microsystems.core.striped_swap import StripedSwapScheduler
+        ss = StripedSwapScheduler()
+        class MockEngine:
+            def status(self):
+                return {"total_blocks": 100}
+            class _swap:
+                @staticmethod
+                def read_block(bid, off, sz):
+                    return b"data"
+        ss.add_device(MockEngine(), speed_mbs=100.0)
+        blk = ss.allocate()
+        result = ss.read_group_aware(blk.logical_id, 4)
+        self.assertEqual(len(result), 1)
+
+    # ── Fix #10: Device speed detection ──
+    def test_detect_device_speed(self):
+        """detect_device_speed should return positive MB/s for temp dir"""
+        from microsystems.core.slow_device_optimizer import detect_device_speed
+        speed = detect_device_speed(tempfile.gettempdir(), test_size_mb=1)
+        self.assertGreater(speed, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

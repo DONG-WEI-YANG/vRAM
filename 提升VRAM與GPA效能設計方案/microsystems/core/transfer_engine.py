@@ -270,6 +270,12 @@ class TransferEngine:
             self._execute_transfer(req)
             self._queue.task_done()
 
+            # Flash I/O: also check flush after each transfer (prevents starvation)
+            if self._flash_io and self._flash_io.should_flush():
+                batch = self._flash_io.flush()
+                if batch:
+                    self._execute_batch(batch)
+
     def _execute_transfer(self, req: TransferRequest) -> None:
         """執行單一傳輸請求"""
         req.status = TransferStatus.IN_PROGRESS
@@ -344,11 +350,18 @@ class TransferEngine:
 
     def _execute_batch(self, batch) -> None:
         """執行融合批次傳輸（Flash I/O）"""
+        # Build block_id → request reverse index (pending is keyed by request_id)
+        block_to_req = {
+            r.block_id: r for r in self._pending.values()
+            if r.status == TransferStatus.QUEUED
+        }
+        executed = 0
         groups = self._flash_io.group_by_direction(batch)
         for (src, dst), requests in groups.items():
             for block_id, s, d, size in requests:
-                req = self._pending.get(block_id)
+                req = block_to_req.get(block_id)
                 if req:
                     self._execute_transfer(req)
-        logger.debug("Flash I/O batch #%d: %d transfers fused",
-                     batch.batch_id, len(batch.requests))
+                    executed += 1
+        logger.debug("Flash I/O batch #%d: %d/%d transfers executed",
+                     batch.batch_id, executed, len(batch.requests))

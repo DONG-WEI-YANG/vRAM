@@ -239,6 +239,14 @@ class MemoryPool:
             self._sw_tracker.access(block_id)
             self._importance_evictor.record_access(block_id)
 
+            # LLM: periodic placement cache snapshot (populates even without free)
+            if blk.data_tag and self._placement_cache and blk.access_count % 50 == 0:
+                self._placement_cache.record(
+                    blk.data_tag, blk.tier.value,
+                    access_count=blk.access_count,
+                    latency_ms=0.0,
+                )
+
             # LLM: periodic anchor auto-detection
             if self._sw_tracker._total_accesses % 200 == 0:
                 block_stats = [
