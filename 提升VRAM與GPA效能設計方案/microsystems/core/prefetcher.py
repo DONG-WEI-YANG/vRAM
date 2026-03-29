@@ -27,6 +27,7 @@ from typing import Optional, List, Dict, Set, Callable, Any
 
 from .memory_pool import MemoryPool, MemoryTier
 from .transfer_engine import TransferEngine, TransferPriority
+from .llm_optimizations import SpeculativePrefetchEngine
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,12 @@ class PredictivePrefetcher:
         # 統計
         self._stats = PrefetchStats()
 
+        # LLM optimization: speculative prefetch with learning
+        self._speculative = SpeculativePrefetchEngine(
+            base_lookahead=lookahead,
+            max_lookahead=8,
+        )
+
         # 背景預取執行緒
         self._prefetch_thread: Optional[threading.Thread] = None
         self._event = threading.Event()
@@ -170,6 +177,11 @@ class PredictivePrefetcher:
             total = self._stats.prefetch_hits + self._stats.prefetch_misses
             if total > 0:
                 self._stats.hit_rate_pct = (self._stats.prefetch_hits / total) * 100
+
+            # Speculative verification: learn from hit/miss
+            self._speculative.verify_prediction(
+                list(self._prefetched), block_id
+            )
 
     def create_prefetch_plan(self, current_layer: int) -> PrefetchPlan:
         """
@@ -239,11 +251,11 @@ class PredictivePrefetcher:
 
     def _plan_adaptive(self, current: int) -> tuple:
         """
-        自適應策略：根據歷史 compute_time 與 io_time 的比率
-        動態調整 lookahead 深度。
+        自適應策略：結合 compute/io 比率 + speculative learning。
 
         若 GPU 計算很快（compute < io），增加 lookahead
         若 GPU 計算較慢（compute > io），減少 lookahead
+        再用 speculative engine 的 transition matrix 優化預測順序。
         """
         if len(self._compute_history) > 5:
             avg_compute = sum(self._compute_history) / len(self._compute_history)
@@ -257,6 +269,32 @@ class PredictivePrefetcher:
                     self._lookahead = max(self._lookahead - 1, 1)
 
             self._stats.avg_lookahead = self._lookahead
+
+        # 使用 speculative engine 的 learned patterns
+        if current < len(self._layers):
+            current_block = self._layers[current].block_id
+            self._speculative.record_access(current_block)
+
+            available = [
+                lp.block_id for lp in self._layers[current + 1:]
+            ]
+            predicted = self._speculative.predict_next(current_block, available)
+
+            if predicted:
+                targets = []
+                save_ms = 0.0
+                for bid in predicted[:self._lookahead]:
+                    blk = self._pool.get_block(bid)
+                    if blk and blk.tier == MemoryTier.EXTERNAL:
+                        if bid not in self._in_flight:
+                            targets.append(bid)
+                            # 估算節省時間
+                            for lp in self._layers:
+                                if lp.block_id == bid:
+                                    save_ms += lp.load_time_ms
+                                    break
+                if targets:
+                    return targets, save_ms
 
         return self._plan_sequential(current)
 

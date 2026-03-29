@@ -47,6 +47,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Dict, List, Tuple, Any
 
+from .llm_optimizations import SharedCompressionDict
+
 logger = logging.getLogger(__name__)
 
 # ── 嘗試載入 LZ4（可選依賴）──
@@ -142,6 +144,11 @@ class SlowDeviceOptimizer:
 
         self._stats = OptimizerStats()
 
+        # MLA-inspired shared compression dictionary
+        self._shared_dict = SharedCompressionDict()
+        self._dict_trained = False
+        self._training_samples: List[bytes] = []
+
         logger.info(
             "SlowDeviceOptimizer: compression=%s, quantization=%s, "
             "buffer=%dMB, seq_block=%dKB",
@@ -170,12 +177,23 @@ class SlowDeviceOptimizer:
 
         Returns: 實際寫入大小（壓縮後）
         """
+        # 0. MLA: collect training samples for shared dictionary
+        if not self._dict_trained and len(self._training_samples) < 8:
+            self._training_samples.append(data[:4096])  # sample first 4KB
+            if len(self._training_samples) >= 8:
+                self._shared_dict.train(self._training_samples)
+                self._dict_trained = True
+                self._training_samples.clear()
+
         # 1. 量化
         if self._quantization != QuantizationLevel.NONE:
             data = self._quantize(data)
 
-        # 2. 壓縮
-        compressed = self._compress(data)
+        # 2. 壓縮（使用 MLA shared dict 增強）
+        if self._dict_trained:
+            compressed = self._shared_dict.compress(data)
+        else:
+            compressed = self._compress(data)
         self._stats.total_bytes_in += len(data)
         self._stats.total_bytes_out += len(compressed)
         if self._stats.total_bytes_in > 0:

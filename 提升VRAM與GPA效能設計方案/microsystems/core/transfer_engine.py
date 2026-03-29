@@ -21,6 +21,7 @@ from enum import Enum, IntEnum
 from typing import Optional, Callable, Dict, List, Any
 
 from .memory_pool import MemoryTier
+from .llm_optimizations import FlashIOEngine
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,12 @@ class TransferEngine:
         # 實際 I/O 回調（由裝置層提供）
         self._io_handlers: Dict[str, Callable] = {}
 
+        # Flash I/O: fused batch transfer
+        self._flash_io = FlashIOEngine(
+            batch_window_ms=50.0,
+            max_batch_size=32,
+        )
+
         logger.info("TransferEngine created: workers=%d, queue_depth=%d",
                      max_workers, max_queue_depth)
 
@@ -213,6 +220,10 @@ class TransferEngine:
             priority=priority,
             callback=callback,
         )
+        # Flash I/O: also submit to batch engine for fused transfer
+        if self._flash_io:
+            self._flash_io.submit(block_id, src.value, dst.value, size_bytes)
+
         return self.submit(req)
 
     def cancel(self, request_id: str) -> bool:
@@ -242,6 +253,11 @@ class TransferEngine:
             try:
                 priority, counter, req = self._queue.get(timeout=1.0)
             except queue.Empty:
+                # Flash I/O: flush batched transfers on idle
+                if self._flash_io and self._flash_io.should_flush():
+                    batch = self._flash_io.flush()
+                    if batch:
+                        self._execute_batch(batch)
                 continue
 
             if req is None:  # sentinel
@@ -325,3 +341,14 @@ class TransferEngine:
             req.elapsed_ms,
             req.throughput_mbs,
         )
+
+    def _execute_batch(self, batch) -> None:
+        """執行融合批次傳輸（Flash I/O）"""
+        groups = self._flash_io.group_by_direction(batch)
+        for (src, dst), requests in groups.items():
+            for block_id, s, d, size in requests:
+                req = self._pending.get(block_id)
+                if req:
+                    self._execute_transfer(req)
+        logger.debug("Flash I/O batch #%d: %d transfers fused",
+                     batch.batch_id, len(batch.requests))

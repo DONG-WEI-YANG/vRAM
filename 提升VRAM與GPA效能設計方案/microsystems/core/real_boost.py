@@ -38,6 +38,7 @@ from .mmap_engine import MmapSwapEngine
 from .safety_policy import SafetyPolicy, GLOBAL_POLICY_PATH
 from .striped_swap import StripedSwapScheduler
 from .vhd_pagefile import VhdPagefileEngine
+from .llm_optimizations import LLMOptimizationSuite
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,8 @@ class RealBoostEngine:
         self._vhd_active: bool = False
         self._linux_swap_engine = None  # LinuxSwapEngine instance
         self._state_lock = threading.RLock()  # 保護所有共享狀態
+        # LLM-inspired optimization suite
+        self._llm_opts = LLMOptimizationSuite()
 
     # ── 持久化設定：存在 SD 卡上，下次插入免重測 ──
 
@@ -438,6 +441,10 @@ class RealBoostEngine:
             if linux_st.get("active"):
                 result["method"] = "linux_parallel_swap"
                 result["system_wide"] = True
+
+        # LLM optimization stats
+        if self._llm_opts:
+            result["llm_optimizations"] = self._llm_opts.full_stats()
 
         # 多裝置聚合狀態
         if engines:

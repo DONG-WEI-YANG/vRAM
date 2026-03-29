@@ -19,6 +19,13 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, Dict, List, Callable, Any
 
+from .llm_optimizations import (
+    BlockPlacementCache,
+    SlidingWindowTracker,
+    ImportanceBasedEvictor,
+    StreamingMemoryManager,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,6 +142,15 @@ class MemoryPool:
         self._total_allocs = 0
         self._total_frees = 0
 
+        # LLM-inspired optimizations
+        self._placement_cache = BlockPlacementCache()
+        self._sw_tracker = SlidingWindowTracker(window_size=512)
+        self._importance_evictor = ImportanceBasedEvictor()
+        self._streaming_mgr = StreamingMemoryManager(
+            max_vram_blocks=64,
+            max_ram_blocks=256,
+        )
+
         logger.info(
             "MemoryPool created: VRAM=%.1fGB RAM=%.1fGB External=%.1fGB",
             vram_capacity_bytes / (1024**3),
@@ -159,6 +175,12 @@ class MemoryPool:
         with self._lock:
             if block_id in self._blocks:
                 raise ValueError(f"Block '{block_id}' already exists")
+
+            # LLM: warm-start — lookup preferred tier from placement cache
+            if tag and preferred_tier is None and self._placement_cache:
+                cached_tier = self._placement_cache.lookup(tag)
+                if cached_tier is not None:
+                    preferred_tier = MemoryTier(cached_tier)
 
             tier_order = [MemoryTier.VRAM, MemoryTier.RAM, MemoryTier.EXTERNAL]
             if preferred_tier is not None:
@@ -192,6 +214,14 @@ class MemoryPool:
             self._lru[blk.tier].pop(block_id, None)
             self._total_frees += 1
 
+            # LLM: record placement data for future warm-start
+            if blk.data_tag and self._placement_cache:
+                self._placement_cache.record(
+                    blk.data_tag, blk.tier.value,
+                    access_count=blk.access_count,
+                    latency_ms=0.0,
+                )
+
     def access(self, block_id: str) -> MemoryTier:
         """
         記錄一次存取。更新 LRU 順序並檢查是否需要 promotion。
@@ -204,6 +234,18 @@ class MemoryPool:
 
             blk.access_count += 1
             blk.last_access_ts = time.time()
+
+            # LLM optimizations: sliding window + importance tracking
+            self._sw_tracker.access(block_id)
+            self._importance_evictor.record_access(block_id)
+
+            # LLM: periodic anchor auto-detection
+            if self._sw_tracker._total_accesses % 200 == 0:
+                block_stats = [
+                    (bid, b.access_count, time.time() - b.last_access_ts)
+                    for bid, b in self._blocks.items()
+                ]
+                self._streaming_mgr.auto_detect_anchors(block_stats)
 
             # 更新 LRU（移到最近存取的位置）
             lru = self._lru[blk.tier]
@@ -365,7 +407,7 @@ class MemoryPool:
         return True
 
     def _try_evict(self, tier: MemoryTier, needed_bytes: int) -> bool:
-        """嘗試從指定層級 evict 區塊以騰出空間"""
+        """嘗試從指定層級 evict 區塊以騰出空間（使用 importance-based 評分）"""
         state = self._tiers[tier]
         freed = 0
         next_tier = MemoryTier(tier + 1) if tier < MemoryTier.EXTERNAL else None
@@ -373,13 +415,38 @@ class MemoryPool:
         if next_tier is None:
             return False  # 最低層無法再往下 evict
 
-        # 從 LRU 最舊的開始 evict
-        for bid in list(self._lru[tier].keys()):
-            if freed >= needed_bytes:
-                break
-            blk = self._blocks.get(bid)
-            if blk and not blk.is_pinned:
-                if self._try_demote(bid, next_tier):
+        # LLM: streaming capacity check
+        vram_count = sum(1 for b in self._blocks.values() if b.tier == MemoryTier.VRAM)
+        ram_count = sum(1 for b in self._blocks.values() if b.tier == MemoryTier.RAM)
+        if self._streaming_mgr.should_evict(vram_count, ram_count):
+            logger.debug("Streaming capacity exceeded: VRAM=%d RAM=%d", vram_count, ram_count)
+
+        # 使用 importance-based eviction（取代純 LRU）
+        block_data = [
+            (bid, blk.access_count, blk.last_access_ts, blk.size_bytes)
+            for bid in self._lru[tier]
+            if (blk := self._blocks.get(bid)) and not blk.is_pinned
+               and not self._streaming_mgr.is_anchor(bid)
+        ]
+
+        if block_data:
+            victims = self._importance_evictor.select_victims(
+                block_data, count=len(block_data)
+            )
+            for victim in victims:
+                if freed >= needed_bytes:
+                    break
+                blk = self._blocks.get(victim.block_id)
+                if blk and self._try_demote(victim.block_id, next_tier):
                     freed += blk.size_bytes
+        else:
+            # Fallback: 原始 LRU
+            for bid in list(self._lru[tier].keys()):
+                if freed >= needed_bytes:
+                    break
+                blk = self._blocks.get(bid)
+                if blk and not blk.is_pinned:
+                    if self._try_demote(bid, next_tier):
+                        freed += blk.size_bytes
 
         return state.free_bytes >= needed_bytes

@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any
 
+from .llm_optimizations import GroupedBlockScheduler
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,10 @@ class StripedSwapScheduler:
         self._next_logical_id = 0
         self._lock = threading.Lock()
         self._pool: Optional[ThreadPoolExecutor] = None
+        # GQA-inspired grouped block I/O
+        self._grouped_scheduler = GroupedBlockScheduler(min_co_access=3)
+        self._gqa_access_count = 0
+        self._gqa_flush_interval = 20
 
     def add_device(self, engine: Any, speed_mbs: float) -> int:
         """加入一個裝置到 stripe group，回傳 device index。"""
@@ -152,6 +158,11 @@ class StripedSwapScheduler:
         block = self._block_map.get(logical_id)
         if not block:
             return False
+        # GQA: track co-access for group detection
+        self._grouped_scheduler.record_access(str(logical_id))
+        self._gqa_access_count += 1
+        if self._gqa_access_count % self._gqa_flush_interval == 0:
+            self._grouped_scheduler.flush_window()
         dev = self._devices[block.device_idx]
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
@@ -168,6 +179,11 @@ class StripedSwapScheduler:
         block = self._block_map.get(logical_id)
         if not block:
             return None
+        # GQA: track co-access for group detection
+        self._grouped_scheduler.record_access(str(logical_id))
+        self._gqa_access_count += 1
+        if self._gqa_access_count % self._gqa_flush_interval == 0:
+            self._grouped_scheduler.flush_window()
         dev = self._devices[block.device_idx]
         swap = getattr(dev.engine, '_swap', None)
         if not swap:
@@ -265,6 +281,15 @@ class StripedSwapScheduler:
                 thread_name_prefix="stripe-io",
             )
         return self._pool
+
+    def detect_block_groups(self) -> list:
+        """觸發 GQA block group 偵測並更新裝置親和性。"""
+        self._grouped_scheduler.flush_window()
+        groups = self._grouped_scheduler.detect_groups()
+        if groups and self._devices:
+            speeds = [d.speed_mbs for d in self._devices]
+            self._grouped_scheduler.assign_device_affinity(speeds)
+        return groups
 
     def stats(self) -> Dict[str, Any]:
         """回傳 stripe group 統計。"""
