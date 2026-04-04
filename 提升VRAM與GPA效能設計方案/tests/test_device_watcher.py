@@ -154,5 +154,42 @@ class TestDeviceWatcherCallbacks(unittest.TestCase):
         self.assertEqual(len(second), 1)
 
 
+from unittest.mock import patch
+
+
+class TestDeviceWatcherLifecycle(unittest.TestCase):
+    """Test start/stop and fallback behavior."""
+
+    def test_start_stop(self):
+        watcher = DeviceWatcher()
+        watcher.start()
+        self.assertTrue(watcher._active)
+        watcher.stop()
+        self.assertFalse(watcher._active)
+
+    def test_double_start_is_safe(self):
+        watcher = DeviceWatcher()
+        watcher.start()
+        watcher.start()  # should not raise
+        watcher.stop()
+
+    def test_stop_without_start_is_safe(self):
+        watcher = DeviceWatcher()
+        watcher.stop()  # should not raise
+
+    @patch("microsystems.core.device_watcher.subprocess.Popen",
+           side_effect=FileNotFoundError("no powershell"))
+    def test_fallback_to_polling_when_ps_fails(self, mock_popen):
+        watcher = DeviceWatcher()
+        watcher.start()
+        self.assertFalse(watcher.is_event_driven)
+        self.assertTrue(watcher._active)
+        watcher.stop()
+
+    def test_is_event_driven_property(self):
+        watcher = DeviceWatcher()
+        self.assertFalse(watcher.is_event_driven)
+
+
 if __name__ == "__main__":
     unittest.main()
