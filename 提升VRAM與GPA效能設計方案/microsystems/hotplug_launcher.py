@@ -45,60 +45,54 @@ def _run_hidden(cmd, **kwargs):
 
 
 def get_my_drive() -> Optional[str]:
-    """找到自己所在的磁碟機代號"""
+    """
+    找到自己所在的磁碟機代號。
+
+    判斷方式（Windows）：
+      1. 先從 exe 路徑提取磁碟代號，排除系統碟
+      2. Fallback: 用 BusType 掃描所有外接裝置（不依賴 DriveType）
+    """
     candidates = []
 
     # 1. PyInstaller 打包時，用 sys.executable 的原始路徑
     if getattr(sys, 'frozen', False):
         candidates.append(sys.executable)
-        # sys.executable 在 PyInstaller onefile 可能指向暫存目錄
-        # 但 os.path.dirname(sys.executable) 才是 exe 真正所在位置
-        # 額外嘗試 sys.argv[0] 因為它保留了原始呼叫路徑
         if sys.argv:
             candidates.append(os.path.abspath(sys.argv[0]))
     else:
         candidates.append(os.path.abspath(__file__))
 
-    # 2. 從候選路徑中找出可移除式磁碟
+    # 2. 從候選路徑中找出非系統碟
+    sys_drive = os.environ.get("SystemDrive", "C:")[0].upper() if platform.system().lower() == "windows" else ""
     for path in candidates:
         drive = os.path.splitdrive(path)[0]
         if drive and len(drive) >= 2:
             letter = drive[0].upper()
-            # 排除 C: (系統) 和暫存目錄常見的磁碟
-            if letter not in ("C",):
+            if letter != sys_drive:
                 return letter
 
-    # 3. Fallback: 掃描所有可移除式磁碟
+    # 3. Fallback: 用 BusType 掃描外接裝置（修復：不再只找 Removable）
     if platform.system().lower() == "windows":
         try:
-            r = _run_hidden(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-Volume | Where-Object {$_.DriveType -eq 'Removable' -and $_.DriveLetter -and $_.Size -gt 0} "
-                 "| Select-Object DriveLetter | ConvertTo-Json"],
-                timeout=8,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                data = json.loads(r.stdout)
-                if isinstance(data, dict):
-                    data = [data]
-                for v in data:
-                    if v.get("DriveLetter"):
-                        return v["DriveLetter"]
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-            pass
+            from .core.device_query import get_external_drive_letters
+            ext_drives = get_external_drive_letters()
+            if ext_drives:
+                return ext_drives[0]["letter"]
+        except Exception as e:
+            logger.warning("get_my_drive fallback failed: %s", e)
     else:
-        # Linux: 掃描可移除式掛載點
         try:
             r = _run_hidden(
-                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,SIZE,TYPE"],
+                ["lsblk", "-J", "-o", "NAME,MOUNTPOINT,RM,SIZE,TYPE,TRAN"],
                 timeout=8,
             )
             if r.returncode == 0:
                 data = json.loads(r.stdout)
                 for dev in data.get("blockdevices", []):
-                    if not dev.get("rm"):
+                    tran = (dev.get("tran") or "").lower()
+                    if tran not in ("usb", "nvme", "mmc") and not dev.get("rm"):
                         continue
-                    for part in dev.get("children", []):
+                    for part in dev.get("children", [dev]):
                         mp = part.get("mountpoint")
                         if mp and mp not in ("/", "/boot", "/home"):
                             return mp
@@ -169,7 +163,7 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
             info["fs"] = v.get("FileSystem", "")
             info["capacity_gb"] = v.get("Size", 0) / (1024 ** 3)
             info["free_gb"] = v.get("SizeRemaining", 0) / (1024 ** 3)
-            info["is_removable"] = v.get("DriveType") == "Removable"
+            info["is_removable"] = v.get("DriveType") == "Removable"  # 初始值，後面用 BusType 校正
 
         # Physical disk info
         r2 = _run_hidden(
@@ -195,29 +189,20 @@ def detect_device_type(letter: str) -> Dict[str, Any]:
                     spindle = pd.get("SpindleSpeed", 0)
                     info["is_rotational"] = spindle and spindle > 0
 
-                    name_lower = info["friendly_name"].lower()
+                    # BusType 校正 is_removable — USB/SD/TB 裝置一律視為可移除
+                    from .core.device_query import classify_device, EXTERNAL_BUS_TYPES
                     bus = info["bus"]
-                    media = info["media"]
+                    if bus in EXTERNAL_BUS_TYPES or bus == "NVMe":
+                        info["is_removable"] = True
 
-                    # 分類六種設備
-                    if bus == "NVMe":
-                        if info["is_removable"]:
-                            info["type"] = "nvme_enclosure"  # 外接 NVMe = Enclosure
-                        else:
-                            info["type"] = "sd_express"  # 內建 NVMe 走 SD 讀卡機 = SD Express
-                    elif bus == "SD" or "card" in name_lower or "sd" in name_lower:
-                        info["type"] = "sd_card"
-                    elif info["is_rotational"] or media == "HDD" or "hdd" in name_lower:
-                        info["type"] = "hdd"
-                    elif bus == "USB":
-                        if media == "SSD" or info["capacity_gb"] > 200:
-                            info["type"] = "usb_ssd"
-                        else:
-                            info["type"] = "usb_drive"
-                    elif "thunderbolt" in bus.lower() or "usb4" in bus.lower():
-                        info["type"] = "nvme_enclosure"
-                    else:
-                        info["type"] = "usb_drive"
+                    # 用 classify_device() 統一分類（BusType 驅動）
+                    info["type"] = classify_device(
+                        bus_type=bus,
+                        media_type=info["media"],
+                        friendly_name=info["friendly_name"],
+                        spindle_speed=pd.get("SpindleSpeed", 0),
+                        capacity_gb=info["capacity_gb"],
+                    )
 
     except Exception as e:
         logger.warning("Detection failed: %s", e)
@@ -551,6 +536,17 @@ class BoosterApp:
         # 開始監控輪詢
         self._poll_monitor()
 
+        # 即時裝置監聽
+        try:
+            from .core.device_watcher import DeviceWatcher, DeviceEvent, ExpansionAction
+            self._device_watcher = DeviceWatcher()
+            self._device_watcher.on_change(self._on_device_event)
+            self._device_watcher.start()
+            logger.info("hotplug_launcher: DeviceWatcher attached")
+        except Exception as e:
+            logger.warning("DeviceWatcher unavailable: %s", e)
+            self._device_watcher = None
+
     def _poll_monitor(self):
         if not self._running or self._phase != "active":
             return
@@ -610,6 +606,96 @@ class BoosterApp:
                 logger.debug("Poll error: %s", e)
 
         self._root.after(10000, self._poll_monitor)  # 10 秒輪詢，減少資源佔用
+
+    def _on_device_event(self, change):
+        """Handle real-time device arrival/removal from DeviceWatcher."""
+        from .core.device_watcher import DeviceEvent, ExpansionAction
+
+        if change.event == DeviceEvent.REMOVED:
+            if change.drive_letter == self._my_drive:
+                logger.critical("Own drive %s removed — immediate exit", change.drive_letter)
+                try:
+                    self._root.after(0, self._quit)
+                except Exception:
+                    pass
+                return
+
+            if self._phase == "active":
+                msg = f"{change.drive_letter}:\\ removed"
+                logger.warning("Device removed: %s", msg)
+                try:
+                    self._root.after(0, lambda m=msg: self._show_notification(m, self.ORANGE))
+                except Exception:
+                    pass
+
+        elif change.event == DeviceEvent.ARRIVED:
+            if self._phase != "active":
+                return
+
+            info = change.device_info or {}
+            action = info.get("expansion_action", "ignore")
+            name = info.get("friendly_name", "Unknown")
+            letter = change.drive_letter
+
+            if action == ExpansionAction.AUTO_EXPAND.value:
+                msg = f"Auto-joined {letter}:\\ ({name})"
+                logger.info("Auto-expand: %s", msg)
+                try:
+                    self._root.after(0, lambda m=msg: self._show_notification(m, self.GREEN))
+                except Exception:
+                    pass
+
+            elif action == ExpansionAction.PROMPT_USER.value:
+                msg_text = f"Found {name} ({letter}:\\). Add to expansion?"
+                logger.info("Prompt: %s", msg_text)
+                try:
+                    self._root.after(0, lambda l=letter, n=name: self._show_expansion_prompt(l, n))
+                except Exception:
+                    pass
+
+    def _show_notification(self, message: str, color: str):
+        """Show a temporary notification bar at the top of the active view."""
+        import tkinter as tk
+        if not hasattr(self, '_notif_lbl'):
+            self._notif_lbl = tk.Label(
+                self._frame, text="", font=("Segoe UI", 9),
+                fg="white", bg=self.BG2, anchor="w", padx=10, pady=4,
+            )
+        self._notif_lbl.configure(text=message, bg=color)
+        children = self._frame.winfo_children()
+        if children:
+            self._notif_lbl.pack(fill="x", before=children[0])
+        else:
+            self._notif_lbl.pack(fill="x")
+        self._root.after(8000, lambda: self._notif_lbl.pack_forget())
+
+    def _show_expansion_prompt(self, letter: str, name: str):
+        """Show a prompt asking user whether to add a device for expansion."""
+        import tkinter as tk
+        prompt_f = tk.Frame(self._frame, bg="#1a237e", padx=8, pady=6)
+        children = self._frame.winfo_children()
+        if children:
+            prompt_f.pack(fill="x", before=children[0])
+        else:
+            prompt_f.pack(fill="x")
+
+        tk.Label(prompt_f, text=f"Found: {name} ({letter}:\\)",
+                 font=("Segoe UI", 9, "bold"), fg="white", bg="#1a237e").pack(anchor="w")
+
+        btn_f = tk.Frame(prompt_f, bg="#1a237e")
+        btn_f.pack(anchor="e", pady=(4, 0))
+
+        def accept():
+            prompt_f.destroy()
+            self._show_notification(f"Added {letter}:\\ to expansion", self.GREEN)
+
+        def decline():
+            prompt_f.destroy()
+
+        tk.Button(btn_f, text="Add", font=("Segoe UI", 8), fg="white",
+                  bg="#00c853", relief="flat", padx=8, command=accept).pack(side="left", padx=4)
+        tk.Button(btn_f, text="Skip", font=("Segoe UI", 8), fg=self.GRAY,
+                  bg="#333333", relief="flat", padx=8, command=decline).pack(side="left")
 
     # ── Actions ──
 
@@ -689,6 +775,9 @@ class BoosterApp:
                 logging.root.removeHandler(handler)
             except Exception:
                 pass
+
+        if hasattr(self, '_device_watcher') and self._device_watcher:
+            self._device_watcher.stop()
 
         if self._root:
             self._root.destroy()
