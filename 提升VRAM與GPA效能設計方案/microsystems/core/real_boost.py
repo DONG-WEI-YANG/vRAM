@@ -564,19 +564,59 @@ class RealBoostEngine:
     # ── Windows: Multi-Device Mmap Swap ──
 
     def _scan_external_drives(self, primary_letter: str) -> list:
-        """掃描所有可用的外接裝置（排除 C: 和 D: 系統碟）"""
-        drives = [primary_letter]
-        # 直接用 os.path.exists 掃描所有磁碟代號，不依賴 PowerShell
-        for letter in "EFGHIJKLMNOPQRSTUVWXYZ":
-            if letter in drives or letter in ("C", "D"):
-                continue
-            if os.path.exists(f"{letter}:\\"):
-                try:
-                    usage = shutil.disk_usage(f"{letter}:\\")
-                    if usage.total > 1024 ** 3:  # > 1GB
-                        drives.append(letter)
-                except OSError:
-                    pass
+        """
+        掃描所有可用的外接裝置。
+
+        使用 BusType 判斷（不再硬排除特定磁碟代號）：
+          - USB, SD, Thunderbolt, USB4 → 一定是外接
+          - NVMe（非系統碟）→ 外接
+          - 內建 SATA/NVMe 系統碟 → 排除
+        """
+        drives = [primary_letter.upper()]
+
+        if self._is_windows:
+            try:
+                from .device_query import get_external_drive_letters
+                ext = get_external_drive_letters()
+                for d in ext:
+                    letter = d["letter"].upper()
+                    if letter not in drives:
+                        # 確認磁碟可存取且 > 1GB
+                        try:
+                            usage = shutil.disk_usage(f"{letter}:\\")
+                            if usage.total > 1024 ** 3:
+                                drives.append(letter)
+                        except OSError:
+                            pass
+            except Exception as e:
+                logger.warning("BusType scan failed, using os.path fallback: %s", e)
+                # Fallback: 原始邏輯但排除系統碟
+                sys_drive = os.environ.get("SystemDrive", "C:")[0].upper()
+                for letter in "EFGHIJKLMNOPQRSTUVWXYZ":
+                    if letter in drives or letter == sys_drive:
+                        continue
+                    if os.path.exists(f"{letter}:\\"):
+                        try:
+                            usage = shutil.disk_usage(f"{letter}:\\")
+                            if usage.total > 1024 ** 3:
+                                drives.append(letter)
+                        except OSError:
+                            pass
+        else:
+            # Linux: 掃描 /media, /mnt, /run/media
+            for base in ("/media", "/mnt", "/run/media"):
+                if not os.path.isdir(base):
+                    continue
+                for entry in os.scandir(base):
+                    path = entry.path
+                    if entry.is_dir() and path not in drives:
+                        try:
+                            usage = shutil.disk_usage(path)
+                            if usage.total > 1024 ** 3:
+                                drives.append(path)
+                        except OSError:
+                            pass
+
         return drives
 
     def _activate_windows(self, letter: str, use_pct: float,
@@ -594,55 +634,78 @@ class RealBoostEngine:
         drives = self._scan_external_drives(letter)
         report(f"found {len(drives)} device(s): {', '.join(d + ':' for d in drives)}")
 
-        # ── 嘗試 VHD Bridge（主策略）──
+        # ── 嘗試 VHD Bridge（主策略 — 全系統受益）──
         report("trying VHD pagefile (system-wide benefit)...")
-        try:
-            self._vhd_engine = VhdPagefileEngine()
-            vhd_result = self._vhd_engine.activate(
-                drive_letters=drives,
-                use_percent=use_pct,
-                on_progress=report,
-            )
+        vhd_errors = []
+        for attempt in range(1, 3):  # 最多重試 2 次
+            try:
+                self._vhd_engine = VhdPagefileEngine()
+                vhd_result = self._vhd_engine.activate(
+                    drive_letters=drives,
+                    use_percent=use_pct,
+                    on_progress=report,
+                )
 
-            if vhd_result.get("success"):
-                self._vhd_active = True
-                self._active = True
-                self._swap_size_bytes = int(vhd_result.get("added_gb", 0) * (1024**3))
+                if vhd_result.get("success"):
+                    self._vhd_active = True
+                    self._active = True
+                    self._swap_size_bytes = int(vhd_result.get("added_gb", 0) * (1024**3))
 
-                # Assess system pagefile
-                self._system_pf_bytes = self._get_system_pagefile_bytes()
+                    # Assess system pagefile
+                    self._system_pf_bytes = self._get_system_pagefile_bytes()
 
-                # Start hot-detect for new devices
-                self._known_drives = set(drives)
-                self._hotdetect_stop.clear()
-                self._hotdetect_thread = threading.Thread(
-                    target=self._hot_detect_loop, daemon=True, name="hotplug-detect")
-                self._hotdetect_thread.start()
-                report("hot-detect started (30s interval)")
+                    # Start hot-detect for new devices
+                    self._known_drives = set(drives)
+                    self._hotdetect_stop.clear()
+                    self._hotdetect_thread = threading.Thread(
+                        target=self._hot_detect_loop, daemon=True, name="hotplug-detect")
+                    self._hotdetect_thread.start()
+                    report("hot-detect started (30s interval)")
 
-                after_mem = self.get_system_memory()
-                return {
-                    "success": True,
-                    "method": "vhd_pagefile",
-                    "system_wide": True,
-                    "device_count": vhd_result.get("device_count", 0),
-                    "devices": vhd_result.get("devices", []),
-                    "added_gb": vhd_result.get("added_gb", 0),
-                    "system_pagefile_gb": round(self._system_pf_bytes / (1024**3), 1),
-                    "total_usable_gb": round(
-                        after_mem.get("physical_total", 0) / (1024**3) +
-                        vhd_result.get("added_gb", 0) +
-                        self._system_pf_bytes / (1024**3), 1),
-                    "needs_reboot": False,
-                }
-        except Exception as e:
-            logger.warning("VHD pagefile failed: %s, falling back to mmap", e)
-            report(f"VHD failed ({e}), trying mmap fallback...")
+                    after_mem = self.get_system_memory()
+                    return {
+                        "success": True,
+                        "method": "vhd_pagefile",
+                        "system_wide": True,
+                        "device_count": vhd_result.get("device_count", 0),
+                        "devices": vhd_result.get("devices", []),
+                        "added_gb": vhd_result.get("added_gb", 0),
+                        "system_pagefile_gb": round(self._system_pf_bytes / (1024**3), 1),
+                        "total_usable_gb": round(
+                            after_mem.get("physical_total", 0) / (1024**3) +
+                            vhd_result.get("added_gb", 0) +
+                            self._system_pf_bytes / (1024**3), 1),
+                        "needs_reboot": False,
+                    }
+                else:
+                    err = vhd_result.get("error", "unknown")
+                    vhd_errors.append(f"attempt {attempt}: {err}")
+                    report(f"VHD attempt {attempt} failed: {err}")
+            except Exception as e:
+                vhd_errors.append(f"attempt {attempt}: {e}")
+                report(f"VHD attempt {attempt} exception: {e}")
+
             self._vhd_engine = None
             self._vhd_active = False
 
-        # ── Fallback: mmap swap（原有邏輯）──
-        report("using mmap swap (process-level only)...")
+        # ── VHD 全部失敗：診斷並警告 ──
+        diag = "; ".join(vhd_errors)
+        logger.error(
+            "VHD pagefile failed after 2 attempts: %s\n"
+            "  Falling back to mmap (process-local ONLY, Task Manager will NOT show increase).\n"
+            "  To enable system-wide benefit, ensure:\n"
+            "    1. Running as Administrator (UAC elevated)\n"
+            "    2. Hyper-V / Virtual Disk service enabled\n"
+            "    3. Device has sufficient free space (>= 512MB)",
+            diag,
+        )
+        report(
+            f"WARNING: VHD pagefile failed ({diag}). "
+            f"Using mmap fallback — only this process benefits. "
+            f"Run as Administrator for system-wide expansion."
+        )
+
+        # ── Fallback: mmap swap（僅本程式受益）──
         return self._activate_windows_mmap(letter, use_pct, report)
 
     def _activate_windows_mmap(self, letter: str, use_pct: float,
@@ -815,6 +878,8 @@ class RealBoostEngine:
 
             logger.info("Hot-detect: new device %s:", drv)
 
+            # 策略：永遠先嘗試 VHD（全系統受益），失敗才 mmap
+            vhd_ok = False
             if self._vhd_active and self._vhd_engine:
                 # VHD 模式：加入新裝置的 VHD pagefile
                 try:
@@ -826,11 +891,31 @@ class RealBoostEngine:
                         with self._state_lock:
                             self._known_drives.add(drv)
                             self._swap_size_bytes += int(result.get("added_gb", 0) * (1024**3))
-                        logger.info("Hot-added VHD pagefile on %s:", drv)
+                        logger.info("Hot-added VHD pagefile on %s: (system-wide)", drv)
+                        vhd_ok = True
                 except Exception as e:
                     logger.warning("Hot-add VHD failed for %s: %s", drv, e)
-            else:
-                # mmap fallback 模式：用原有邏輯
+            elif not self._vhd_active:
+                # 目前是 mmap 模式 — 嘗試升級到 VHD
+                try:
+                    engine = VhdPagefileEngine()
+                    result = engine.activate(
+                        drive_letters=[drv], use_percent=80.0,
+                        on_progress=lambda msg: logger.info("VHD-upgrade %s: %s", drv, msg),
+                    )
+                    if result.get("success"):
+                        self._vhd_engine = engine
+                        self._vhd_active = True
+                        with self._state_lock:
+                            self._known_drives.add(drv)
+                            self._swap_size_bytes += int(result.get("added_gb", 0) * (1024**3))
+                        logger.info("Hot-added VHD pagefile on %s: (upgraded from mmap!)", drv)
+                        vhd_ok = True
+                except Exception as e:
+                    logger.debug("VHD upgrade attempt failed for %s: %s", drv, e)
+
+            if not vhd_ok:
+                # mmap fallback：僅本程式受益
                 # 測速
                 cached = self._load_cached_config(mount)
                 cached_speed = cached.get("effective_speed_mbs", 0) if cached else 0
@@ -875,6 +960,109 @@ class RealBoostEngine:
 
                     swap_gb = swap_bytes / (1024 ** 3)
                     logger.info("Hot-added %s: %.1f MB/s, +%.1fGB swap", drv, effective_speed, swap_gb)
+
+    # ── Public: 動態擴充/移除 ──────────────────────────────────────
+
+    def expand_to_device(self, letter: str) -> Dict[str, Any]:
+        """
+        動態加入一顆新的外接裝置到 swap pool。
+
+        由 DeviceWatcher 的 ARRIVED callback 觸發。
+        內部重用 _hot_detect_scan 的完整邏輯（測速→配置→加入 striped）。
+
+        Returns:
+            {"success": True/False, "drive": letter, "added_gb": float, ...}
+        """
+        if not self._active:
+            return {"success": False, "error": "Booster not active"}
+
+        letter = letter.upper()
+        if letter in self._known_drives:
+            return {"success": False, "error": f"{letter}: already in pool"}
+
+        mount = f"{letter}:\\"
+        try:
+            usage = shutil.disk_usage(mount)
+        except OSError:
+            return {"success": False, "error": f"{letter}: inaccessible"}
+
+        if usage.free < 512 * (1024 ** 2):
+            return {"success": False, "error": f"{letter}: < 512MB free"}
+
+        logger.info("expand_to_device: adding %s:\\", letter)
+
+        # 觸發 hot-detect scan — 它會自動發現這顆新裝置
+        # 因為 letter 不在 _known_drives 中
+        try:
+            self._hot_detect_scan()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        if letter in self._known_drives:
+            added_gb = 0.0
+            method = "vhd_pagefile" if self._vhd_active else "mmap_swap"
+
+            if self._vhd_active and self._vhd_engine:
+                # VHD 模式：從 VHD engine status 取得 added_gb
+                st = self._vhd_engine.status()
+                for dev in st.get("devices", []):
+                    if dev.get("drive") == letter:
+                        added_gb = dev.get("swap_gb", 0)
+                        break
+            else:
+                # mmap 模式
+                for eng in self._mmap_engines:
+                    st = eng.status()
+                    if str(st.get("swap_path", "")).startswith(mount):
+                        added_gb = self._engine_swap_bytes.get(eng.uid, 0) / (1024 ** 3)
+                        break
+
+            logger.info("expand_to_device: %s added (+%.1fGB, %s, system_wide=%s)",
+                        letter, added_gb, method, self._vhd_active)
+            return {
+                "success": True,
+                "drive": letter,
+                "added_gb": round(added_gb, 1),
+                "method": method,
+                "system_wide": self._vhd_active,
+            }
+        else:
+            return {"success": False, "error": f"{letter}: activation failed"}
+
+    def remove_device(self, letter: str) -> Dict[str, Any]:
+        """
+        從 swap pool 移除一顆裝置（裝置已被拔除）。
+
+        由 DeviceWatcher 的 REMOVED callback 觸發。
+        標記該裝置的所有 engine 為 degraded，重算容量。
+
+        Returns:
+            {"success": True, "drive": letter, "lost_gb": float}
+        """
+        letter = letter.upper()
+        if letter not in self._known_drives:
+            return {"success": False, "error": f"{letter}: not in pool"}
+
+        mount = f"{letter}:\\"
+        lost_bytes = 0
+
+        with self._state_lock:
+            for eng in list(self._mmap_engines):
+                st = eng.status()
+                if str(st.get("swap_path", "")).startswith(mount):
+                    lost_bytes += self._engine_swap_bytes.get(eng.uid, 0)
+                    # 觸發 degraded 狀態（關閉 mmap handles、停止 I/O）
+                    eng._on_disconnect()
+
+            self._known_drives.discard(letter)
+            self._swap_size_bytes = max(0, self._swap_size_bytes - lost_bytes)
+
+        lost_gb = lost_bytes / (1024 ** 3)
+        logger.critical(
+            "remove_device: %s:\\ removed — lost %.1fGB, remaining %.1fGB",
+            letter, lost_gb, self._swap_size_bytes / (1024 ** 3),
+        )
+        return {"success": True, "drive": letter, "lost_gb": round(lost_gb, 1)}
 
     # ── 裝置狀態變化 ──
 
