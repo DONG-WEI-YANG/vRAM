@@ -137,6 +137,7 @@ class HealthMonitor:
         self._on_reconnect: Optional[Callable[[str], None]] = None
 
         self._is_windows = platform.system().lower() == "windows"
+        self._watcher = None
 
     def register_device(
         self,
@@ -165,6 +166,31 @@ class HealthMonitor:
 
     def on_reconnect(self, callback: Callable[[str], None]) -> None:
         self._on_reconnect = callback
+
+    def attach_watcher(self, watcher) -> None:
+        """
+        Attach a DeviceWatcher for instant connection/disconnection detection.
+
+        When attached, connection status is event-driven (< 1s).
+        Temperature/wear/error polling continues at the configured interval.
+        """
+        from .device_watcher import DeviceEvent
+        self._watcher = watcher
+
+        def _on_watcher_event(change):
+            if change.event == DeviceEvent.REMOVED:
+                device_id = f"drive_{change.drive_letter}"
+                logger.info("Watcher: instant disconnect for %s", device_id)
+                if self._on_disconnect:
+                    self._on_disconnect(device_id)
+            elif change.event == DeviceEvent.ARRIVED:
+                device_id = f"drive_{change.drive_letter}"
+                logger.info("Watcher: instant reconnect for %s", device_id)
+                if self._on_reconnect:
+                    self._on_reconnect(device_id)
+
+        watcher.on_change(_on_watcher_event)
+        logger.info("HealthMonitor: attached DeviceWatcher (event-driven connection detection)")
 
     def start(self) -> None:
         """啟動背景監控執行緒"""

@@ -191,5 +191,50 @@ class TestDeviceWatcherLifecycle(unittest.TestCase):
         self.assertFalse(watcher.is_event_driven)
 
 
+from microsystems.core.health_monitor import HealthMonitor
+
+
+class TestHealthMonitorWatcherIntegration(unittest.TestCase):
+    """Test that HealthMonitor receives instant events from DeviceWatcher."""
+
+    def test_attach_watcher(self):
+        monitor = HealthMonitor(check_interval_s=60)
+        watcher = DeviceWatcher()
+        monitor.attach_watcher(watcher)
+        self.assertIs(monitor._watcher, watcher)
+
+    def test_disconnect_via_watcher(self):
+        monitor = HealthMonitor(check_interval_s=60)
+        watcher = DeviceWatcher()
+        disconnected = []
+        monitor.on_disconnect(lambda did: disconnected.append(did))
+        monitor.attach_watcher(watcher)
+
+        # Simulate device removal
+        watcher._snapshot = {"E": {"bus_type": "USB", "friendly_name": "T5",
+                                    "media_type": "SSD", "spindle_speed": 0,
+                                    "size_bytes": 500_000_000_000,
+                                    "disk_number": 2}}
+        watcher._process_snapshot({})
+
+        self.assertEqual(len(disconnected), 1)
+        self.assertIn("E", disconnected[0])
+
+    def test_reconnect_via_watcher(self):
+        monitor = HealthMonitor(check_interval_s=60)
+        watcher = DeviceWatcher()
+        reconnected = []
+        monitor.on_reconnect(lambda did: reconnected.append(did))
+        monitor.attach_watcher(watcher)
+
+        # Simulate device arrival
+        watcher._snapshot = {}
+        watcher._process_snapshot({"E": {"bus_type": "USB", "friendly_name": "T5",
+                                          "media_type": "SSD", "spindle_speed": 0,
+                                          "size_bytes": 500_000_000_000,
+                                          "disk_number": 2}})
+        self.assertEqual(len(reconnected), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
