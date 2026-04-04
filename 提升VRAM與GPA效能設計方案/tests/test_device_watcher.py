@@ -236,5 +236,82 @@ class TestHealthMonitorWatcherIntegration(unittest.TestCase):
         self.assertEqual(len(reconnected), 1)
 
 
+class TestEndToEndEventFlow(unittest.TestCase):
+    """Integration: watcher -> health_monitor -> system handler."""
+
+    def test_removal_reaches_system_handler(self):
+        """Simulate: device removed -> watcher -> monitor -> disconnect callback."""
+        watcher = DeviceWatcher()
+        monitor = HealthMonitor(check_interval_s=60)
+
+        disconnect_log = []
+        monitor.on_disconnect(lambda did: disconnect_log.append(did))
+        monitor.attach_watcher(watcher)
+
+        # Also track raw watcher events
+        watcher_log = []
+        watcher.on_change(lambda c: watcher_log.append(c))
+
+        # Set initial state: drive E exists
+        watcher._snapshot = {"E": {"bus_type": "USB", "friendly_name": "T5",
+                                    "media_type": "SSD", "spindle_speed": 0,
+                                    "size_bytes": 500_000_000_000}}
+
+        # Drive E disappears
+        watcher._process_snapshot({})
+
+        # Watcher saw the event
+        self.assertEqual(len(watcher_log), 1)
+        self.assertEqual(watcher_log[0].event, DeviceEvent.REMOVED)
+
+        # Monitor received instant disconnect
+        self.assertEqual(len(disconnect_log), 1)
+        self.assertIn("E", disconnect_log[0])
+
+    def test_arrival_with_expansion_policy(self):
+        """Simulate: NVMe device plugged in -> auto-expand classification."""
+        watcher = DeviceWatcher()
+        events = []
+        watcher.on_change(events.append)
+
+        watcher._snapshot = {}
+        watcher._process_snapshot({
+            "G": {
+                "bus_type": "NVMe",
+                "friendly_name": "Samsung 990 Pro",
+                "media_type": "SSD",
+                "spindle_speed": 0,
+                "size_bytes": 1_000_000_000_000,
+            },
+        })
+
+        self.assertEqual(len(events), 1)
+        evt = events[0]
+        self.assertEqual(evt.event, DeviceEvent.ARRIVED)
+        self.assertEqual(evt.drive_letter, "G")
+        self.assertEqual(evt.device_info["device_type"], "nvme_enclosure")
+        self.assertEqual(evt.device_info["expansion_action"], "auto_expand")
+
+    def test_arrival_usb_drive_prompts(self):
+        """Simulate: USB drive plugged in -> prompt classification."""
+        watcher = DeviceWatcher()
+        events = []
+        watcher.on_change(events.append)
+
+        watcher._snapshot = {}
+        watcher._process_snapshot({
+            "H": {
+                "bus_type": "USB",
+                "friendly_name": "Generic USB Flash",
+                "media_type": "",
+                "spindle_speed": 0,
+                "size_bytes": 32_000_000_000,
+            },
+        })
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].device_info["expansion_action"], "prompt_user")
+
+
 if __name__ == "__main__":
     unittest.main()
