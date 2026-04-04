@@ -93,5 +93,66 @@ class TestExpansionPolicy(unittest.TestCase):
         self.assertEqual(action, ExpansionAction.IGNORE)
 
 
+from typing import List
+from microsystems.core.device_watcher import DeviceWatcher
+
+
+class TestDeviceWatcherCallbacks(unittest.TestCase):
+    """Test callback registration and dispatch via manual snapshot injection."""
+
+    def setUp(self):
+        self.watcher = DeviceWatcher()
+        self.events: List[DeviceChangeInfo] = []
+        self.watcher.on_change(self.events.append)
+
+    def test_arrival_fires_callback(self):
+        self.watcher._snapshot = {"E": {"bus_type": "USB", "friendly_name": "T5",
+                                         "media_type": "SSD", "spindle_speed": 0,
+                                         "size_bytes": 500_000_000_000}}
+        new_snap = dict(self.watcher._snapshot)
+        new_snap["G"] = {"bus_type": "NVMe", "friendly_name": "NVMe SSD",
+                         "media_type": "SSD", "spindle_speed": 0,
+                         "size_bytes": 1_000_000_000_000}
+        self.watcher._process_snapshot(new_snap)
+
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0].event, DeviceEvent.ARRIVED)
+        self.assertEqual(self.events[0].drive_letter, "G")
+
+    def test_removal_fires_callback(self):
+        self.watcher._snapshot = {
+            "E": {"bus_type": "USB", "friendly_name": "T5",
+                  "media_type": "SSD", "spindle_speed": 0,
+                  "size_bytes": 500_000_000_000},
+            "F": {"bus_type": "SD", "friendly_name": "SD Card",
+                  "media_type": "SSD", "spindle_speed": 0,
+                  "size_bytes": 128_000_000_000},
+        }
+        new_snap = {"E": self.watcher._snapshot["E"]}
+        self.watcher._process_snapshot(new_snap)
+
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0].event, DeviceEvent.REMOVED)
+        self.assertEqual(self.events[0].drive_letter, "F")
+
+    def test_no_change_no_callback(self):
+        self.watcher._snapshot = {"E": {"bus_type": "USB", "friendly_name": "T5",
+                                         "media_type": "SSD", "spindle_speed": 0,
+                                         "size_bytes": 500_000_000_000}}
+        self.watcher._process_snapshot(dict(self.watcher._snapshot))
+        self.assertEqual(len(self.events), 0)
+
+    def test_multiple_callbacks(self):
+        second: List[DeviceChangeInfo] = []
+        self.watcher.on_change(second.append)
+
+        self.watcher._snapshot = {}
+        self.watcher._process_snapshot({"E": {"bus_type": "USB", "friendly_name": "T5",
+                                               "media_type": "SSD", "spindle_speed": 0,
+                                               "size_bytes": 500_000_000_000}})
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(len(second), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,10 +12,13 @@ Fallback: 3-second polling via get_external_drive_letters()
 from __future__ import annotations
 
 import logging
+import platform
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Callable, Dict, List, Any
+
+from .device_query import get_external_drive_letters, classify_device
 
 logger = logging.getLogger(__name__)
 
@@ -81,3 +84,78 @@ def evaluate_expansion_policy(
         return ExpansionAction.AUTO_EXPAND
 
     return _EXPANSION_MAP.get(device_type, ExpansionAction.IGNORE)
+
+
+class DeviceWatcher:
+    """
+    Real-time device insertion/removal watcher.
+
+    Primary:  PowerShell WMI event subscription (< 1s)
+    Fallback: 3-second polling
+
+    Usage:
+        watcher = DeviceWatcher()
+        watcher.on_change(my_callback)
+        watcher.start()
+        ...
+        watcher.stop()
+    """
+
+    def __init__(self) -> None:
+        self._callbacks: List[Callable[[DeviceChangeInfo], None]] = []
+        self._snapshot: Dict[str, Dict] = {}
+        self._is_windows = platform.system().lower() == "windows"
+
+    def on_change(self, callback: Callable[[DeviceChangeInfo], None]) -> None:
+        """Register a callback for device arrival/removal events."""
+        self._callbacks.append(callback)
+
+    def take_snapshot(self) -> Dict[str, Dict]:
+        """Take a current snapshot of external drives. Returns {letter: info_dict}."""
+        drives = get_external_drive_letters()
+        return {d["letter"].upper(): d for d in drives}
+
+    def _process_snapshot(self, new_snapshot: Dict[str, Dict]) -> None:
+        """Compare new snapshot with stored one, fire callbacks for changes."""
+        arrived, removed = diff_snapshots(self._snapshot, new_snapshot)
+
+        for letter in removed:
+            old_info = self._snapshot.get(letter)
+            change = DeviceChangeInfo(
+                event=DeviceEvent.REMOVED,
+                drive_letter=letter,
+                device_info=old_info,
+                timestamp=time.time(),
+            )
+            self._fire(change)
+
+        for letter in arrived:
+            info = new_snapshot.get(letter, {})
+            # Enrich with device classification
+            device_type = classify_device(
+                bus_type=info.get("bus_type", ""),
+                media_type=info.get("media_type", ""),
+                friendly_name=info.get("friendly_name", ""),
+                spindle_speed=info.get("spindle_speed", 0),
+                capacity_gb=info.get("size_bytes", 0) / (1024 ** 3),
+            )
+            info["device_type"] = device_type
+            info["expansion_action"] = evaluate_expansion_policy(
+                device_type, info.get("bus_type", ""),
+            ).value
+            change = DeviceChangeInfo(
+                event=DeviceEvent.ARRIVED,
+                drive_letter=letter,
+                device_info=info,
+                timestamp=time.time(),
+            )
+            self._fire(change)
+
+        self._snapshot = new_snapshot
+
+    def _fire(self, change: DeviceChangeInfo) -> None:
+        for cb in self._callbacks:
+            try:
+                cb(change)
+            except Exception as e:
+                logger.error("DeviceWatcher callback error: %s", e)
