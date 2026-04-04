@@ -216,6 +216,17 @@ class SDVRAMSystem:
         self._monitor.on_reconnect(self._handle_reconnect)
         self._monitor.start()
 
+        # 即時裝置監聽（取代 HealthMonitor 的連線 polling）
+        try:
+            from ..core.device_watcher import DeviceWatcher
+            self._device_watcher = DeviceWatcher()
+            self._device_watcher.on_change(self._on_device_change)
+            self._monitor.attach_watcher(self._device_watcher)
+            self._device_watcher.start()
+        except Exception as e:
+            logger.warning("DeviceWatcher not available: %s", e)
+            self._device_watcher = None
+
         self._is_active = True
         self._start_time = time.time()
 
@@ -244,6 +255,9 @@ class SDVRAMSystem:
             return
 
         logger.info("Deactivating SD-VRAM Booster...")
+
+        if hasattr(self, '_device_watcher') and self._device_watcher:
+            self._device_watcher.stop()
 
         if self._prefetcher:
             self._prefetcher.stop()
@@ -410,6 +424,18 @@ class SDVRAMSystem:
             priority=TransferPriority.NORMAL,
         )
         return True
+
+    def _on_device_change(self, change) -> None:
+        """Handle real-time device events from DeviceWatcher."""
+        from ..core.device_watcher import DeviceEvent, ExpansionAction
+        if change.event == DeviceEvent.ARRIVED:
+            info = change.device_info or {}
+            action = info.get("expansion_action", "ignore")
+            if action == ExpansionAction.AUTO_EXPAND.value:
+                logger.info(
+                    "Auto-expanding to %s:\\ (%s)",
+                    change.drive_letter, info.get("friendly_name", ""),
+                )
 
     def _handle_disconnect(self, device_id: str) -> None:
         """SD 卡被拔出的緊急處理"""
