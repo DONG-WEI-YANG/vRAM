@@ -492,9 +492,11 @@ def run_single_benchmark(
         if is_fast:
             layer_hit_count += 1
             pool.access(bid)
+            # RAM→VRAM promotion: skip for MoE experts (they change every token)
             if blk.tier == MemoryTier.RAM and config != BenchmarkConfig.UNIFIED_MEMORY:
-                evictions += _ensure_vram_space(lp.size_bytes)
-                pool.promote(bid, MemoryTier.VRAM)
+                if "expert_" not in bid:
+                    evictions += _ensure_vram_space(lp.size_bytes)
+                    pool.promote(bid, MemoryTier.VRAM)
         else:
             layer_miss_count += 1
             if config != BenchmarkConfig.UNIFIED_MEMORY:
@@ -577,21 +579,9 @@ def run_single_benchmark(
                     profile_cursor += 1
 
                 elif "attn" in lp.block_id:
-                    # Attention: 全部存取
+                    # Attention block: 全部存取
                     if prefetcher:
                         prefetcher.notify_layer_start(profile_cursor)
-                        plan = prefetcher.create_prefetch_plan(profile_cursor)
-                        for tbid in plan.prefetch_targets:
-                            tblk = pool.get_block(tbid)
-                            if tblk and tblk.tier == MemoryTier.EXTERNAL:
-                                if pool.promote(tbid, MemoryTier.RAM):
-                                    ti = _bid_to_idx.get(tbid, -1)
-                                    if ti >= 0:
-                                        tlp = profiles[ti]
-                                        phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
-                                        total_logical_io += tlp.size_bytes
-                                        total_physical_io += phys
-                                        prefetcher.report_transfer_stats(ti, tlp.size_bytes, phys)
 
                     _access_block(lp.block_id, profile_cursor)
                     time.sleep(lp.compute_time_ms / 10000.0)
@@ -599,8 +589,43 @@ def run_single_benchmark(
                         prefetcher.notify_layer_complete(profile_cursor, lp.compute_time_ms)
                     profile_cursor += 1
 
-                    # Expert blocks: 只存取被路由的
+                    # Expert routing: 決定此 token 此層啟動哪些 expert
                     selected = _select_experts(token_idx, transformer_block)
+
+                    # ★ MoE-Aware Prefetch (CAAP 專屬)
+                    # 三層策略：
+                    #   1. 當前層的 predicted experts (routing temporal locality)
+                    #   2. 下一層的 attention block (必定需要)
+                    #   3. 下一層的 predicted experts (speculative)
+                    if prefetcher:
+                        # 從 attention block ID 提取層號
+                        layer_num = int(lp.block_id.split("_")[1])
+
+                        def _prefetch_bid(bid: str) -> None:
+                            nonlocal total_logical_io, total_physical_io
+                            tblk = pool.get_block(bid)
+                            if tblk and tblk.tier == MemoryTier.EXTERNAL:
+                                if pool.promote(bid, MemoryTier.RAM):
+                                    ti = _bid_to_idx.get(bid, -1)
+                                    if ti >= 0:
+                                        tlp = profiles[ti]
+                                        phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
+                                        total_logical_io += tlp.size_bytes
+                                        total_physical_io += phys
+                                        prefetcher.report_transfer_stats(ti, tlp.size_bytes, phys)
+
+                        # 1. 當前層 expert: 用前 token 路由預測
+                        if token_idx > 0:
+                            predicted = _select_experts(token_idx - 1, transformer_block)
+                            for pe in predicted:
+                                _prefetch_bid(f"block_{layer_num}_expert_{pe}")
+
+                        # 2. 下一層 attention (必定需要，成本低)
+                        next_layer = layer_num + 1
+                        if next_layer < spec.num_layers - 1:
+                            _prefetch_bid(f"block_{next_layer}_attn")
+
+                    # Expert blocks: 只存取被路由的
                     for e in range(spec.num_experts):
                         expert_profile_idx = profile_cursor + e
                         if expert_profile_idx < len(profiles) and e in selected:
