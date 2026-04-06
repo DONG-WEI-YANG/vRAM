@@ -55,6 +55,7 @@ GB = 1024 * MB
 class ModelScale(Enum):
     LLAMA3_8B = "llama3_8b"
     LLAMA3_70B = "llama3_70b"
+    MIXTRAL_8X7B = "mixtral_8x7b"
 
 
 @dataclass
@@ -78,6 +79,15 @@ class ModelSpec:
     vram_capacity_bytes: int        # 模擬 GPU VRAM (只能放幾層)
     ram_capacity_bytes: int
     external_capacity_bytes: int
+
+    # MoE 參數
+    is_moe: bool = False
+    num_experts: int = 1            # 每層的 expert 數量
+    active_experts: int = 1         # 每個 token 啟動的 expert 數量
+    # MoE 層中每個 expert 的大小 = scaled_layer_size_bytes / num_experts
+
+    # 頻寬模擬
+    bandwidth_mbs: float = 200.0    # 外部裝置頻寬 (MB/s)
 
     @property
     def total_model_bytes(self) -> int:
@@ -126,6 +136,30 @@ MODEL_SPECS: Dict[ModelScale, ModelSpec] = {
         ram_capacity_bytes=1 * GB,
         external_capacity_bytes=8 * GB,
     ),
+    ModelScale.MIXTRAL_8X7B: ModelSpec(
+        name="Mixtral-8x7B",
+        num_layers=32,                          # 32 transformer blocks
+        real_layer_size_bytes=int(1.4 * GB),    # 每層含 8 experts ~1.4GB
+        scale_factor=16,
+        scaled_layer_size_bytes=88 * MB,        # 1.4GB / 16
+
+        # MoE: Attention 壓縮率高 (共享)，Expert FFN 壓縮率變異大
+        attention_compression=4.0,
+        ffn_compression=2.0,                    # Expert FFN 較獨特，壓縮率較低
+        embedding_compression=1.5,
+
+        compute_time_range=(8.0, 20.0),         # ms
+
+        vram_capacity_bytes=256 * MB,
+        ram_capacity_bytes=1 * GB,
+        external_capacity_bytes=4 * GB,
+
+        # MoE 專有：每層 8 experts，每 token 啟動 2 個
+        is_moe=True,
+        num_experts=8,
+        active_experts=2,
+        bandwidth_mbs=200.0,
+    ),
 }
 
 
@@ -166,21 +200,75 @@ def _layer_compute_time_ms(layer_idx: int, num_layers: int, spec: ModelSpec) -> 
 
 
 def generate_layer_profiles(spec: ModelSpec) -> List[LayerProfile]:
-    """產生模型的 LayerProfile 列表"""
+    """
+    產生模型的 LayerProfile 列表。
+
+    對於 MoE 模型，每個 transformer block 拆成：
+      - 1 個 attention block (共享)
+      - N 個 expert FFN blocks (各自獨立)
+    """
     profiles = []
-    for i in range(spec.num_layers):
-        cr = _layer_compression_ratio(i, spec.num_layers, spec)
-        ct = _layer_compute_time_ms(i, spec.num_layers, spec)
-        lp = LayerProfile(
-            layer_id=f"layer_{i}",
-            block_id=f"block_{i}",
-            size_bytes=spec.scaled_layer_size_bytes,
-            compute_time_ms=ct,
-            compression_ratio=cr,
-        )
-        # 預填壓縮率 (模擬已經觀察到真實值)
-        lp._ratio_samples = 1
-        profiles.append(lp)
+    if not spec.is_moe:
+        for i in range(spec.num_layers):
+            cr = _layer_compression_ratio(i, spec.num_layers, spec)
+            ct = _layer_compute_time_ms(i, spec.num_layers, spec)
+            lp = LayerProfile(
+                layer_id=f"layer_{i}",
+                block_id=f"block_{i}",
+                size_bytes=spec.scaled_layer_size_bytes,
+                compute_time_ms=ct,
+                compression_ratio=cr,
+            )
+            lp._ratio_samples = 1
+            profiles.append(lp)
+    else:
+        # MoE: 每個 block = attention (共享) + N experts (各自獨立)
+        attn_size = spec.scaled_layer_size_bytes // 4         # attention ~25%
+        expert_size = (spec.scaled_layer_size_bytes * 3 // 4) // spec.num_experts  # FFN 75% / N
+
+        for i in range(spec.num_layers):
+            if i == 0 or i == spec.num_layers - 1:
+                # Embedding / LM Head: 單一 block
+                lp = LayerProfile(
+                    layer_id=f"layer_{i}",
+                    block_id=f"block_{i}_embed",
+                    size_bytes=spec.scaled_layer_size_bytes,
+                    compute_time_ms=_layer_compute_time_ms(i, spec.num_layers, spec),
+                    compression_ratio=spec.embedding_compression,
+                )
+                lp._ratio_samples = 1
+                profiles.append(lp)
+                continue
+
+            # Attention block (每個 token 都用)
+            lp_attn = LayerProfile(
+                layer_id=f"layer_{i}_attn",
+                block_id=f"block_{i}_attn",
+                size_bytes=attn_size,
+                compute_time_ms=_layer_compute_time_ms(i, spec.num_layers, spec) * 0.3,
+                compression_ratio=spec.attention_compression,
+            )
+            lp_attn._ratio_samples = 1
+            profiles.append(lp_attn)
+
+            # Expert FFN blocks (每個 token 只用 active_experts 個)
+            for e in range(spec.num_experts):
+                # 不同 expert 壓縮率不同：模擬真實的 expert 特化
+                # expert 0-1: 通用 expert (壓縮率較高，被路由較多)
+                # expert 6-7: 特化 expert (壓縮率較低，被路由較少)
+                cr_variation = spec.ffn_compression * (1.0 + 0.15 * (e - spec.num_experts / 2))
+                cr_variation = max(1.2, cr_variation)
+
+                lp_exp = LayerProfile(
+                    layer_id=f"layer_{i}_expert_{e}",
+                    block_id=f"block_{i}_expert_{e}",
+                    size_bytes=expert_size,
+                    compute_time_ms=_layer_compute_time_ms(i, spec.num_layers, spec) * 0.7 / spec.active_experts,
+                    compression_ratio=cr_variation,
+                )
+                lp_exp._ratio_samples = 1
+                profiles.append(lp_exp)
+
     return profiles
 
 
@@ -220,6 +308,7 @@ class BenchmarkMetrics:
     physical_bandwidth_mbs: float = 0.0
     total_logical_io_bytes: int = 0
     total_physical_io_bytes: int = 0
+    total_io_wait_ms: float = 0.0   # GPU 等待 I/O 的總時間 (miss penalty)
     eviction_count: int = 0
 
     # 記憶體指標
@@ -351,13 +440,18 @@ def run_single_benchmark(
         )
 
     # ── 模擬推理 ──
+    import random as _rng
     total_logical_io = 0
     total_physical_io = 0
+    total_io_wait_ms = 0.0   # GPU 等待 I/O 的總時間 (miss penalty)
     evictions = 0
     layer_hit_count = 0
     layer_miss_count = 0
     peak_vram = 0
     peak_ram = 0
+
+    # 建立 block_id → profile index 查詢表
+    _bid_to_idx: Dict[str, int] = {p.block_id: i for i, p in enumerate(profiles)}
 
     overall_start = time.perf_counter()
     first_token_done = False
@@ -366,7 +460,7 @@ def run_single_benchmark(
     def _ensure_vram_space(needed: int) -> int:
         """驅逐 VRAM 中最冷的 block 以騰出空間，回傳驅逐次數"""
         count = 0
-        max_evictions = 16  # 安全上限，避免無限迴圈
+        max_evictions = 16
         while pool.get_tier_state(MemoryTier.VRAM).free_bytes < needed and count < max_evictions:
             vram_blocks = pool.get_blocks_in_tier(MemoryTier.VRAM)
             unpinned = [b for b in vram_blocks if not b.is_pinned]
@@ -374,78 +468,186 @@ def run_single_benchmark(
                 break
             victim = min(unpinned, key=lambda b: b.last_access_ts)
             if not pool.demote(victim.block_id, MemoryTier.RAM):
-                break  # demote 失敗 (e.g., RAM 也滿了)
+                break
             count += 1
         return count
+
+    def _io_wait_ms(physical_bytes: int) -> float:
+        """計算 demand fetch 的 I/O 等待時間 (ms)"""
+        bw = spec.bandwidth_mbs if hasattr(spec, 'bandwidth_mbs') else 200.0
+        return (physical_bytes / MB / bw) * 1000.0
+
+    def _access_block(bid: str, layer_profile_idx: int) -> None:
+        """存取一個 block: 檢查 hit/miss，執行 demand fetch 並計入 I/O penalty"""
+        nonlocal layer_hit_count, layer_miss_count, evictions
+        nonlocal total_logical_io, total_physical_io, total_io_wait_ms
+
+        lp = profiles[layer_profile_idx]
+        blk = pool.get_block(bid)
+        if not blk:
+            return
+
+        is_fast = blk.tier <= MemoryTier.RAM
+
+        if is_fast:
+            layer_hit_count += 1
+            pool.access(bid)
+            if blk.tier == MemoryTier.RAM and config != BenchmarkConfig.UNIFIED_MEMORY:
+                evictions += _ensure_vram_space(lp.size_bytes)
+                pool.promote(bid, MemoryTier.VRAM)
+        else:
+            layer_miss_count += 1
+            if config != BenchmarkConfig.UNIFIED_MEMORY:
+                evictions += _ensure_vram_space(lp.size_bytes)
+                promoted = pool.promote(bid, MemoryTier.VRAM)
+                if promoted:
+                    physical = int(lp.size_bytes / lp.compression_ratio) if enable_compression else lp.size_bytes
+                    total_logical_io += lp.size_bytes
+                    total_physical_io += physical
+                    # ★ I/O penalty: GPU 必須等這次 demand fetch 完成
+                    total_io_wait_ms += _io_wait_ms(physical)
+                    if prefetcher:
+                        prefetcher.report_transfer_stats(layer_profile_idx, lp.size_bytes, physical)
+                pool.access(bid)
+
+    # ── MoE expert routing: 預先決定每個 token 每層啟動哪些 expert ──
+    def _select_experts(token_idx: int, layer_idx: int) -> List[int]:
+        """模擬 MoE router: 選擇 active_experts 個 expert"""
+        if not spec.is_moe:
+            return []
+        # 使用確定性 seed 以保證可重現
+        _rng.seed(token_idx * 1000 + layer_idx)
+        # 真實 MoE 有 load balancing loss，分佈接近均勻但有偏好
+        # expert 0-1 被選中的機率較高 (模擬 "通用 expert")
+        weights = [1.5 if e < 2 else 1.0 for e in range(spec.num_experts)]
+        total_w = sum(weights)
+        probs = [w / total_w for w in weights]
+        # 加權抽樣（不重複）
+        selected = []
+        remaining = list(range(spec.num_experts))
+        rem_probs = list(probs)
+        for _ in range(spec.active_experts):
+            if not remaining:
+                break
+            r = _rng.random() * sum(rem_probs)
+            cumulative = 0.0
+            for j, (idx, p) in enumerate(zip(remaining, rem_probs)):
+                cumulative += p
+                if r <= cumulative:
+                    selected.append(idx)
+                    remaining.pop(j)
+                    rem_probs.pop(j)
+                    break
+        return selected
 
     for token_idx in range(num_tokens):
         token_start = time.perf_counter()
 
-        for layer_idx in range(spec.num_layers):
-            lp = profiles[layer_idx]
+        # 決定每層要存取哪些 profile
+        if spec.is_moe:
+            # MoE: profiles 是 [embed, attn, expert0..7, attn, expert0..7, ..., embed]
+            # 需要遍歷每個 transformer block，只存取被路由到的 expert
+            profile_cursor = 0
+            transformer_block = 0
 
-            # ── 同步 Prefetch: 在處理當前層之前，執行 prefetch plan ──
-            # Prefetch 將 EXTERNAL → RAM（預熱），demand fetch 將 RAM → VRAM
-            if prefetcher:
-                prefetcher.notify_layer_start(layer_idx)
-                plan = prefetcher.create_prefetch_plan(layer_idx)
-                for target_bid in plan.prefetch_targets:
-                    tblk = pool.get_block(target_bid)
-                    if tblk and tblk.tier == MemoryTier.EXTERNAL:
-                        if pool.promote(target_bid, MemoryTier.RAM):
-                            tidx = next(
-                                (j for j, p in enumerate(profiles) if p.block_id == target_bid),
-                                -1,
-                            )
-                            if tidx >= 0:
-                                tlp = profiles[tidx]
-                                phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
-                                total_logical_io += tlp.size_bytes
-                                total_physical_io += phys
-                                prefetcher.report_transfer_stats(tidx, tlp.size_bytes, phys)
+            while profile_cursor < len(profiles):
+                lp = profiles[profile_cursor]
 
-            # ── 檢查此層是否已在快速層 (VRAM 或 RAM) ──
-            blk = pool.get_block(lp.block_id)
-            is_fast = blk and blk.tier <= MemoryTier.RAM  # VRAM=0, RAM=1
+                if "embed" in lp.block_id:
+                    # Embedding / LM Head: 全部存取
+                    if prefetcher:
+                        prefetcher.notify_layer_start(profile_cursor)
+                        plan = prefetcher.create_prefetch_plan(profile_cursor)
+                        for tbid in plan.prefetch_targets:
+                            tblk = pool.get_block(tbid)
+                            if tblk and tblk.tier == MemoryTier.EXTERNAL:
+                                if pool.promote(tbid, MemoryTier.RAM):
+                                    ti = _bid_to_idx.get(tbid, -1)
+                                    if ti >= 0:
+                                        tlp = profiles[ti]
+                                        phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
+                                        total_logical_io += tlp.size_bytes
+                                        total_physical_io += phys
+                                        prefetcher.report_transfer_stats(ti, tlp.size_bytes, phys)
 
-            if is_fast:
-                layer_hit_count += 1
-                pool.access(lp.block_id)
-                # 如果在 RAM 但不在 VRAM，promote 到 VRAM (快速，幾乎不計 I/O)
-                if blk.tier == MemoryTier.RAM and config != BenchmarkConfig.UNIFIED_MEMORY:
-                    evictions += _ensure_vram_space(lp.size_bytes)
-                    pool.promote(lp.block_id, MemoryTier.VRAM)
-            else:
-                layer_miss_count += 1
-                # Demand fetch: EXTERNAL → VRAM (慢，計入 I/O)
-                if blk and config != BenchmarkConfig.UNIFIED_MEMORY:
-                    evictions += _ensure_vram_space(lp.size_bytes)
-                    promoted = pool.promote(lp.block_id, MemoryTier.VRAM)
-                    if promoted:
-                        physical = int(lp.size_bytes / lp.compression_ratio) if enable_compression else lp.size_bytes
-                        total_logical_io += lp.size_bytes
-                        total_physical_io += physical
-                        if prefetcher:
-                            prefetcher.report_transfer_stats(layer_idx, lp.size_bytes, physical)
-                    pool.access(lp.block_id)
+                    _access_block(lp.block_id, profile_cursor)
+                    time.sleep(lp.compute_time_ms / 10000.0)
+                    if prefetcher:
+                        prefetcher.notify_layer_complete(profile_cursor, lp.compute_time_ms)
+                    profile_cursor += 1
 
-            # 模擬 GPU compute
-            # 用 1/10 的實際 sleep 以加速 benchmark，
-            # 但記錄完整的 compute_time_ms 以正確計算 CAAP lookahead
-            compute_ms = lp.compute_time_ms
-            time.sleep(compute_ms / 10000.0)  # 1/10 speed sleep
+                elif "attn" in lp.block_id:
+                    # Attention: 全部存取
+                    if prefetcher:
+                        prefetcher.notify_layer_start(profile_cursor)
+                        plan = prefetcher.create_prefetch_plan(profile_cursor)
+                        for tbid in plan.prefetch_targets:
+                            tblk = pool.get_block(tbid)
+                            if tblk and tblk.tier == MemoryTier.EXTERNAL:
+                                if pool.promote(tbid, MemoryTier.RAM):
+                                    ti = _bid_to_idx.get(tbid, -1)
+                                    if ti >= 0:
+                                        tlp = profiles[ti]
+                                        phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
+                                        total_logical_io += tlp.size_bytes
+                                        total_physical_io += phys
+                                        prefetcher.report_transfer_stats(ti, tlp.size_bytes, phys)
 
-            # 通知 prefetcher 完成
-            if prefetcher:
-                prefetcher.notify_layer_complete(layer_idx, compute_ms)
+                    _access_block(lp.block_id, profile_cursor)
+                    time.sleep(lp.compute_time_ms / 10000.0)
+                    if prefetcher:
+                        prefetcher.notify_layer_complete(profile_cursor, lp.compute_time_ms)
+                    profile_cursor += 1
 
-            # 追蹤峰值
-            vs = pool.get_tier_state(MemoryTier.VRAM)
-            rs = pool.get_tier_state(MemoryTier.RAM)
-            if vs:
-                peak_vram = max(peak_vram, vs.used_bytes)
-            if rs:
-                peak_ram = max(peak_ram, rs.used_bytes)
+                    # Expert blocks: 只存取被路由的
+                    selected = _select_experts(token_idx, transformer_block)
+                    for e in range(spec.num_experts):
+                        expert_profile_idx = profile_cursor + e
+                        if expert_profile_idx < len(profiles) and e in selected:
+                            _access_block(profiles[expert_profile_idx].block_id, expert_profile_idx)
+                            time.sleep(profiles[expert_profile_idx].compute_time_ms / 10000.0)
+
+                    profile_cursor += spec.num_experts
+                    transformer_block += 1
+                else:
+                    profile_cursor += 1
+
+        else:
+            # 標準 dense model: 順序存取所有層
+            for layer_idx in range(len(profiles)):
+                lp = profiles[layer_idx]
+
+                # ── 同步 Prefetch ──
+                if prefetcher:
+                    prefetcher.notify_layer_start(layer_idx)
+                    plan = prefetcher.create_prefetch_plan(layer_idx)
+                    for target_bid in plan.prefetch_targets:
+                        tblk = pool.get_block(target_bid)
+                        if tblk and tblk.tier == MemoryTier.EXTERNAL:
+                            if pool.promote(target_bid, MemoryTier.RAM):
+                                tidx = _bid_to_idx.get(target_bid, -1)
+                                if tidx >= 0:
+                                    tlp = profiles[tidx]
+                                    phys = int(tlp.size_bytes / tlp.compression_ratio) if enable_compression else tlp.size_bytes
+                                    total_logical_io += tlp.size_bytes
+                                    total_physical_io += phys
+                                    prefetcher.report_transfer_stats(tidx, tlp.size_bytes, phys)
+
+                _access_block(lp.block_id, layer_idx)
+
+                compute_ms = lp.compute_time_ms
+                time.sleep(compute_ms / 10000.0)
+
+                if prefetcher:
+                    prefetcher.notify_layer_complete(layer_idx, compute_ms)
+
+        # 追蹤峰值
+        vs = pool.get_tier_state(MemoryTier.VRAM)
+        rs = pool.get_tier_state(MemoryTier.RAM)
+        if vs:
+            peak_vram = max(peak_vram, vs.used_bytes)
+        if rs:
+            peak_ram = max(peak_ram, rs.used_bytes)
 
         # Token 完成
         token_end = time.perf_counter()
@@ -459,9 +661,13 @@ def run_single_benchmark(
     # ── 清理 ──
 
     # ── 收集指標 ──
-    metrics.total_inference_time_ms = round(total_time_ms, 1)
+    # I/O-aware inference time: 真實時間 + I/O 等待懲罰
+    # (真實 sleep 用 1/10 速度，但 I/O wait 是精確模擬的)
+    io_aware_time_ms = total_time_ms + total_io_wait_ms
+    metrics.total_inference_time_ms = round(io_aware_time_ms, 1)
     metrics.time_to_first_token_ms = round(first_token_time, 1)
-    metrics.tokens_per_sec = round(num_tokens / (total_time_ms / 1000), 2) if total_time_ms > 0 else 0
+    metrics.tokens_per_sec = round(num_tokens / (io_aware_time_ms / 1000), 2) if io_aware_time_ms > 0 else 0
+    metrics.total_io_wait_ms = round(total_io_wait_ms, 1)
 
     total_layer_accesses = layer_hit_count + layer_miss_count
     metrics.prefetch_hit_rate_pct = round(
@@ -523,7 +729,7 @@ def run_full_benchmark(
     avail_gb = _available_ram_gb()
     logger.info("Available RAM: ~%.1f GB", avail_gb)
 
-    models_to_run = [ModelScale.LLAMA3_8B]
+    models_to_run = [ModelScale.LLAMA3_8B, ModelScale.MIXTRAL_8X7B]
     if avail_gb >= 6.0:
         models_to_run.append(ModelScale.LLAMA3_70B)
     else:
@@ -598,7 +804,7 @@ def _print_summary(results: List[BenchmarkMetrics]) -> None:
     for model_name, runs in models.items():
         print(f"\n  Model: {model_name} (scale 1/{runs[0].scale_factor})")
         print(f"  {'Config':<22} {'tok/s':>8} {'TTFT':>8} {'Hit%':>7} "
-              f"{'LA':>4} {'Eff BW':>9} {'Evict':>6}")
+              f"{'LA':>4} {'IO Wait':>9} {'Evict':>6}")
         print("  " + "─" * 68)
 
         for r in runs:
@@ -606,7 +812,7 @@ def _print_summary(results: List[BenchmarkMetrics]) -> None:
                   f"{r.time_to_first_token_ms:>7.0f}ms "
                   f"{r.prefetch_hit_rate_pct:>6.1f}% "
                   f"{r.avg_lookahead:>4.1f} "
-                  f"{r.effective_bandwidth_mbs:>7.1f}MB "
+                  f"{r.total_io_wait_ms:>7.1f}ms "
                   f"{r.eviction_count:>6d}")
 
     print("\n" + "═" * 80)
