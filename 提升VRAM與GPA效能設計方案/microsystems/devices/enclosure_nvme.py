@@ -329,9 +329,12 @@ class EnclosureNVMeDevice(BaseDevice):
             self._tb_version = self._detect_tb_windows()
 
             # 取得外接 NVMe 裝置
+            # 修復：不再用 CanPool 過濾（有分區的外接 NVMe 回報 CanPool=False）
+            # 改用 IsSystem=False 排除系統碟
+            from ..core.device_query import ps_query, _normalize_list
             ps_cmd = (
                 "Get-PhysicalDisk | Where-Object {"
-                "$_.BusType -eq 'NVMe' -and $_.CanPool -eq $true"
+                "$_.BusType -eq 'NVMe' -and $_.IsSystem -ne $true"
                 "} | Select-Object DeviceId,FriendlyName,Size,SerialNumber,Model | ConvertTo-Json"
             )
             result = subprocess.run(

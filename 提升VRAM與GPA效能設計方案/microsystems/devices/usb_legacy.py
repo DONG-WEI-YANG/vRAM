@@ -175,63 +175,84 @@ class USBLegacyDevice(BaseDevice):
             return (100.0, 50.0)
 
     def _detect_windows(self) -> List[DeviceInfo]:
+        """
+        Windows USB 裝置偵測 — 使用 BusType 而非 DriveType。
+
+        策略：
+          1. 取得所有 BusType=USB 的磁碟編號
+          2. 取得磁碟代號 → 磁碟編號映射
+          3. 取得 Volume 資訊（名稱、容量等）
+          4. 交叉比對：只收在 USB 磁碟上的 Volume
+        """
+        from ..core.device_query import ps_query, _normalize_list
+
         devices = []
         try:
-            ps_cmd = (
-                "Get-Volume | Where-Object {"
-                "$_.DriveType -eq 'Removable' -or $_.DriveType -eq 'Fixed'"
-                "} | Select-Object DriveLetter,FileSystemLabel,Size,SizeRemaining,DriveType,FileSystem | ConvertTo-Json"
+            # Step 1: 取得 USB 磁碟編號（BusType 驅動，不受 DriveType 影響）
+            usb_disks = set()
+            usb_data = ps_query(
+                "Get-Disk | Where-Object {$_.BusType -eq 'USB'} "
+                "| Select-Object Number | ConvertTo-Json",
+                label="usb_legacy_disks",
             )
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=15,
+            for disk in _normalize_list(usb_data):
+                num = disk.get("Number")
+                if num is not None:
+                    usb_disks.add(int(num))
+
+            if not usb_disks:
+                logger.info("USB Legacy: no USB-bus disks found")
+                return devices
+
+            # Step 2: 取得磁碟代號 → 磁碟編號映射
+            part_map: Dict[str, int] = {}
+            part_data = ps_query(
+                "Get-Partition | Where-Object {$_.DriveLetter} "
+                "| Select-Object DriveLetter,DiskNumber | ConvertTo-Json",
+                label="usb_legacy_partitions",
             )
-            if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    data = [data]
+            for p in _normalize_list(part_data):
+                letter = p.get("DriveLetter")
+                dn = p.get("DiskNumber")
+                if letter and dn is not None:
+                    part_map[str(letter).upper()] = int(dn)
 
-                # 取得 USB 磁碟清單
-                usb_disks = set()
-                try:
-                    ps2 = "Get-Disk | Where-Object {$_.BusType -eq 'USB'} | Select-Object Number | ConvertTo-Json"
-                    r2 = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command", ps2],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    if r2.returncode == 0 and r2.stdout.strip():
-                        d2 = json.loads(r2.stdout)
-                        if isinstance(d2, dict):
-                            d2 = [d2]
-                        for disk in d2:
-                            usb_disks.add(disk.get("Number"))
-                except Exception:
-                    pass
+            # Step 3: 取得 Volume 資訊
+            vol_data = ps_query(
+                "Get-Volume | Where-Object {$_.DriveLetter -and $_.Size -gt 0} "
+                "| Select-Object DriveLetter,FileSystemLabel,Size,SizeRemaining,"
+                "DriveType,FileSystem | ConvertTo-Json",
+                label="usb_legacy_volumes",
+            )
 
-                # 取得每個 volume 對應的磁碟
-                for vol in data:
-                    letter = vol.get("DriveLetter")
-                    size = vol.get("Size", 0)
-                    dtype = vol.get("DriveType", "")
-                    label = vol.get("FileSystemLabel", "")
+            # Step 4: 交叉比對 — 只收在 USB 磁碟上的 Volume
+            for vol in _normalize_list(vol_data):
+                letter = vol.get("DriveLetter")
+                size = vol.get("Size", 0)
+                label = vol.get("FileSystemLabel", "")
 
-                    if not letter or size <= 0:
-                        continue
+                if not letter or size <= 0:
+                    continue
 
-                    # 只選 USB 裝置（Removable 通常是 USB）
-                    if dtype not in ("Removable",):
-                        continue
+                letter_upper = str(letter).upper()
+                disk_num = part_map.get(letter_upper)
 
-                    mount = f"{letter}:\\"
-                    devices.append(DeviceInfo(
-                        device_id=f"usb_legacy_{letter}",
-                        device_name=f"USB Drive ({label or 'USB'}) [{letter}:]",
-                        model=label or "USB Storage",
-                        protocol=ConnectionProtocol.USB3_GEN1,
-                        capacity_bytes=int(size),
-                        device_path=mount,
-                        is_removable=True,
-                    ))
+                # 核心改動：用 BusType=USB 判斷，不依賴 DriveType
+                if disk_num is None or disk_num not in usb_disks:
+                    continue
+
+                mount = f"{letter_upper}:\\"
+                devices.append(DeviceInfo(
+                    device_id=f"usb_legacy_{letter_upper}",
+                    device_name=f"USB Drive ({label or 'USB'}) [{letter_upper}:]",
+                    model=label or "USB Storage",
+                    protocol=ConnectionProtocol.USB3_GEN1,
+                    capacity_bytes=int(size),
+                    device_path=mount,
+                    is_removable=True,
+                ))
+
+            logger.info("USB Legacy: detected %d USB device(s)", len(devices))
 
         except Exception as e:
             logger.warning("Windows USB legacy detection failed: %s", e)

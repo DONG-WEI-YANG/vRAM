@@ -621,7 +621,13 @@ class BoosterApp:
                 return
 
             if self._phase == "active":
-                msg = f"{change.drive_letter}:\\ removed"
+                # 實際從 swap pool 移除
+                if self._boost_engine:
+                    result = self._boost_engine.remove_device(change.drive_letter)
+                    lost = result.get("lost_gb", 0)
+                    msg = f"{change.drive_letter}:\\ removed (-{lost:.1f}GB)"
+                else:
+                    msg = f"{change.drive_letter}:\\ removed"
                 logger.warning("Device removed: %s", msg)
                 try:
                     self._root.after(0, lambda m=msg: self._show_notification(m, self.ORANGE))
@@ -638,7 +644,12 @@ class BoosterApp:
             letter = change.drive_letter
 
             if action == ExpansionAction.AUTO_EXPAND.value:
-                msg = f"Auto-joined {letter}:\\ ({name})"
+                # 實際加入 swap pool
+                added_gb = 0.0
+                if self._boost_engine:
+                    result = self._boost_engine.expand_to_device(letter)
+                    added_gb = result.get("added_gb", 0) if result.get("success") else 0
+                msg = f"Auto-joined {letter}:\\ ({name}, +{added_gb:.1f}GB)"
                 logger.info("Auto-expand: %s", msg)
                 try:
                     self._root.after(0, lambda m=msg: self._show_notification(m, self.GREEN))
@@ -687,7 +698,20 @@ class BoosterApp:
 
         def accept():
             prompt_f.destroy()
-            self._show_notification(f"Added {letter}:\\ to expansion", self.GREEN)
+            if self._boost_engine:
+                try:
+                    result = self._boost_engine.expand_to_device(letter)
+                    if result.get("success"):
+                        added = result.get("added_gb", 0)
+                        self._show_notification(
+                            f"Added {letter}:\\ (+{added:.1f}GB)", self.GREEN)
+                    else:
+                        self._show_notification(
+                            f"{letter}:\\ failed: {result.get('error', '?')}", self.ORANGE)
+                except Exception as e:
+                    self._show_notification(f"{letter}:\\ error: {e}", self.ORANGE)
+            else:
+                self._show_notification(f"Added {letter}:\\ to expansion", self.GREEN)
 
         def decline():
             prompt_f.destroy()

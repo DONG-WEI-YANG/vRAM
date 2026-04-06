@@ -338,19 +338,18 @@ class VhdBridge:
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def create(self, path: str, size_bytes: int, dynamic: bool = True) -> bool:
+    def create(self, path: str, size_bytes: int, dynamic: bool = False) -> bool:
         """
         建立 VHD/VHDX 虛擬磁碟檔案。
 
-        自動偵測 Windows 版本選擇格式：
-          - Win8+  → VHDX
-          - Win7   → VHD
+        優化：預設使用固定大小 (dynamic=False) 以獲得最佳效能，
+        並將 BlockSize 設定為 2MB 以對齊 SD 卡的常見 Allocation Unit。
 
         Args:
             path:       VHD/VHDX 檔案路徑（建議放在 SD 卡/USB 上）
             size_bytes: 虛擬磁碟最大容量（bytes）
             dynamic:    True = 動態擴展（省空間）；
-                        False = 完全預先配置（效能較好）
+                        False = 完全預先配置（效能較好，建議用於 VRAM 擴展）
 
         Returns:
             True 表示建立成功。
@@ -389,7 +388,9 @@ class VhdBridge:
         params.Version = CREATE_VIRTUAL_DISK_VERSION_2
         params.Version2.UniqueId = GUID_NULL  # 自動產生
         params.Version2.MaximumSize = size_bytes
-        params.Version2.BlockSizeInBytes = 0  # 使用預設值
+        # 優化：設定 BlockSize 為 2MB (2 * 1024 * 1024)
+        # 這能提升大型 Sequential I/O 的效能，並減少 SD 卡碎寫入
+        params.Version2.BlockSizeInBytes = 2 * 1024 * 1024
         params.Version2.SectorSizeInBytes = 512
         params.Version2.PhysicalSectorSizeInBytes = 4096
         params.Version2.ParentPath = None

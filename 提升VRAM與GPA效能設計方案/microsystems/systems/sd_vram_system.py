@@ -436,6 +436,14 @@ class SDVRAMSystem:
                     "Auto-expanding to %s:\\ (%s)",
                     change.drive_letter, info.get("friendly_name", ""),
                 )
+                if hasattr(self, '_boost_engine') and self._boost_engine:
+                    result = self._boost_engine.expand_to_device(change.drive_letter)
+                    if result.get("success"):
+                        logger.info("Expanded: +%.1fGB on %s:\\",
+                                    result.get("added_gb", 0), change.drive_letter)
+        elif change.event == DeviceEvent.REMOVED:
+            if hasattr(self, '_boost_engine') and self._boost_engine:
+                self._boost_engine.remove_device(change.drive_letter)
 
     def _handle_disconnect(self, device_id: str) -> None:
         """SD 卡被拔出的緊急處理"""

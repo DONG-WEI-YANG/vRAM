@@ -75,10 +75,9 @@ class SwapFileManager:
     # ── Public API ─────────────────────────────────────────────────────
 
     def create(self, path: str, size_bytes: int) -> None:
-        """Pre-allocate a swap file filled with zeros.
-
-        *size_bytes* is rounded **up** to the nearest multiple of
-        ``block_size`` so that every block is fully addressable.
+        """Pre-allocate a swap file.
+        
+        優化：強制預先配置實體磁碟空間，避免稀疏檔案導致的嚴重碎片化。
         """
         remainder = size_bytes % self._block_size
         if remainder:
@@ -95,19 +94,30 @@ class SwapFileManager:
             self._total_blocks,
         )
 
-        # 既有檔案大小正確 → 直接複用
         if self._path.exists() and self._path.stat().st_size == size_bytes:
             logger.info("Swap file reuse (size matches)")
             return
 
-        # 快速預配置：seek 到尾端寫 1 byte，讓 OS 配置空間
-        # 不實際寫滿（8GB 寫零在 USB 要好幾分鐘），mmap 會按需寫入
-        with open(self._path, "wb") as f:
-            f.seek(size_bytes - 1)
-            f.write(b"\x00")
-            f.flush()
+        # 強制實體配置，避免 Sparse File 碎片化
+        import sys
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0))
+        try:
+            if sys.platform != "win32" and hasattr(os, "posix_fallocate"):
+                logger.info("Using posix_fallocate to reserve contiguous space...")
+                os.posix_fallocate(fd, 0, size_bytes)
+            else:
+                # Windows 或不支援 fallocate，使用區塊寫入填滿
+                logger.info("Zero-filling to ensure physical allocation...")
+                chunk = b"\x00" * (4 * 1024 * 1024)  # 4MB chunk
+                written = 0
+                while written < size_bytes:
+                    to_write = min(len(chunk), size_bytes - written)
+                    os.write(fd, chunk[:to_write])
+                    written += to_write
+        finally:
+            os.close(fd)
 
-        logger.info("Swap file created (sparse, %.1f MB)", size_bytes / (1024 ** 2))
+        logger.info("Swap file created (Fully allocated, %.1f MB)", size_bytes / (1024 ** 2))
 
     def open(self) -> None:
         """Open the swap file and build the block table."""
@@ -148,6 +158,19 @@ class SwapFileManager:
             length=blk.size,
             offset=blk.offset,
         )
+        
+        # 極致優化：OS Kernel 記憶體提示 (僅支援 Unix)
+        import sys
+        if sys.platform != "win32" and hasattr(mmap, "MADV_SEQUENTIAL"):
+            try:
+                # 預設提示為 Sequential，因為 LLM 權重加載是順序的
+                mm.madvise(mmap.MADV_SEQUENTIAL)
+                # 提示 Kernel 不要將這段記憶體加入 Core Dump
+                if hasattr(mmap, "MADV_DONTDUMP"):
+                    mm.madvise(mmap.MADV_DONTDUMP)
+            except Exception as e:
+                logger.debug("madvise failed: %s", e)
+
         blk.mmap_obj = mm
         blk.state = "mapped"
         logger.debug("Mapped block %d (offset=%d)", block_id, blk.offset)

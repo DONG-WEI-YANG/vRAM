@@ -560,10 +560,13 @@ class LinuxSwapEngine:
                 report(f"  mkswap 失敗: {r.stderr.strip()}")
                 return None
 
-        # 8. swapon -p SWAP_PRIORITY
-        report(f"  啟用 swap (swapon -p {self.SWAP_PRIORITY})...")
+        # 8. swapon -p SWAP_PRIORITY --discard
+        # 極致優化: 加入 --discard 標記 (等同於 -d)。
+        # 這會告訴 Linux Kernel 在釋放 swap 分頁時對底層設備發送 TRIM (NVMe Deallocate) 指令。
+        # 對於 SD Express / NVMe 設備，這是維持持續寫入不掉速的絕對關鍵。
+        report(f"  啟用 swap (swapon -p {self.SWAP_PRIORITY} --discard)...")
         r = _run_cmd(
-            ["swapon", "-p", str(self.SWAP_PRIORITY), swap_path],
+            ["swapon", "-d", "-p", str(self.SWAP_PRIORITY), swap_path],
             timeout=30,
         )
         if r.returncode != 0:

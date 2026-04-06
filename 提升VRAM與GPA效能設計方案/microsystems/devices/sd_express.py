@@ -326,21 +326,45 @@ class SDExpressDevice(BaseDevice):
                 if isinstance(data, dict):
                     data = [data]
 
+                # 取得系統碟編號以排除內建 NVMe SSD
+                sys_disk_num = None
+                try:
+                    from ..core.device_query import get_system_disk_number
+                    sys_disk_num = get_system_disk_number()
+                except Exception:
+                    pass
+
                 for disk in data:
                     friendly = disk.get("FriendlyName", "")
                     size = int(disk.get("Size", 0))
                     media = disk.get("MediaType", "")
+                    dev_id = disk.get("DeviceId", "0")
 
-                    # 過濾：可移除式 NVMe（可能是 SD Express）
-                    if size > 0 and size < 2 * (1024**4):  # < 2TB
-                        dev_id = disk.get("DeviceId", "0")
+                    if size <= 0:
+                        continue
+
+                    # 修復：排除系統碟上的內建 NVMe SSD
+                    try:
+                        if sys_disk_num is not None and int(dev_id) == sys_disk_num:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                    # SD Express 特徵偵測：名稱含 SD/Express/Card 關鍵字
+                    name_lower = friendly.lower()
+                    sd_keywords = ("sd express", "sdexpress", "sd card", "card reader",
+                                   "realtek rts5261", "genesys gl9767", "bayhub o2")
+                    is_likely_sd = any(kw in name_lower for kw in sd_keywords)
+
+                    # 如果是 SD Express 控制器或容量合理 (< 2TB)，收入清單
+                    if is_likely_sd or size < 2 * (1024**4):
                         devices.append(DeviceInfo(
                             device_id=f"sd_nvme_{dev_id}",
                             device_name=f"SD Express ({friendly})",
                             vendor=self._extract_vendor(friendly),
                             model=disk.get("Model", friendly),
                             serial=disk.get("SerialNumber", ""),
-                            protocol=ConnectionProtocol.PCIE_GEN4_X2,  # 預設假設
+                            protocol=ConnectionProtocol.PCIE_GEN4_X2,
                             capacity_bytes=size,
                             device_path=f"\\\\.\\PhysicalDrive{dev_id}",
                             is_removable=True,

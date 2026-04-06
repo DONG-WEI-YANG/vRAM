@@ -598,7 +598,9 @@ class VhdPagefileEngine:
         # Step 6: 建立 pagefile
         swap_mb = swap_bytes // (1024 * 1024)
         report(f"{drive_letter}: 建立 pagefile ({swap_mb} MB) on {mount_letter}:...")
-        pf_ok = self._create_pagefile_on_volume(mount_letter, PAGEFILE_MIN_MB, swap_mb)
+        # 極致優化：強制 Windows 建立固定大小的 Pagefile (Initial == Maximum)
+        # 避免模型載入 VRAM 瞬間溢出導致的 NTFS 碎片化擴展，消除 I/O 阻塞。
+        pf_ok = self._create_pagefile_on_volume(mount_letter, swap_mb, swap_mb)
 
         dev = VhdPagefileDevice(
             drive_letter=drive_letter,
@@ -705,7 +707,7 @@ class VhdPagefileEngine:
             f"$pf = [wmiclass]'Win32_PageFileSetting'; "
             f"$new = $pf.CreateInstance(); "
             f"$new.Name = '{letter}:\\pagefile.sys'; "
-            f"$new.InitialSize = {PAGEFILE_MIN_MB}; "
+            f"$new.InitialSize = {min_mb}; "
             f"$new.MaximumSize = {max_mb}; "
             f"$new.Put()"
         )
