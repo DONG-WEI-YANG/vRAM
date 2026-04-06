@@ -1,0 +1,6 @@
+component,config,model,tokens_per_sec,hit_rate_pct,io_wait_ms,evictions,logical_io_mb,physical_io_mb
+baseline,no_prefetch,Mixtral-8x7B,2.05,46.0,6380.0,76,1276.0,1276.0
++ prefetch,fixed_lookahead_4,Mixtral-8x7B,5.05,53.9,1687.3,68,6193.0,3526.2
++ adaptive,caap_no_compress,Mixtral-8x7B,3.14,53.2,3657.5,89,6187.5,6187.5
++ compress,caap,Mixtral-8x7B,4.47,53.2,2162.2,89,6187.5,3483.6
+ceiling,unified_memory,Mixtral-8x7B,13.17,100.0,0.0,0,0.0,0.0

@@ -1,0 +1,6 @@
+component,config,model,tokens_per_sec,hit_rate_pct,io_wait_ms,evictions,logical_io_mb,physical_io_mb
+baseline,no_prefetch,Llama-3-70B,1.46,13.8,6050.0,18,1210.0,1210.0
++ prefetch,fixed_lookahead_4,Llama-3-70B,2.91,14.3,183.3,9,411290.0,129736.4
++ adaptive,caap_no_compress,Llama-3-70B,2.98,14.7,275.0,9,113245.0,113245.0
++ compress,caap,Llama-3-70B,2.92,14.3,183.3,9,402160.0,126886.2
+ceiling,unified_memory,Llama-3-70B,3.33,100.0,0.0,0,0.0,0.0
