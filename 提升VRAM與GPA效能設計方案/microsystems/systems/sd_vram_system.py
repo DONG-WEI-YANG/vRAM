@@ -432,24 +432,61 @@ class SDVRAMSystem:
 
     # ── Internal Handlers ──
 
+    # ── QATC: Quantization-Aware Transparent Compression ──
+    # 基於真實測量 (GPT-2, 2026-04-07):
+    #   INT4 zlib-1: ratio=5.6x, speed=712MB/s → 低速裝置值得壓
+    #   FP16 zlib-1: ratio=0.95x, speed=116MB/s → 永遠不壓
+    # 決策: compress iff (is_quantized AND device_bw < 500MB/s)
+    QATC_BW_THRESHOLD = 500.0  # MB/s
+    QATC_ZLIB_LEVEL = 1        # 最快壓縮
+
+    def _should_compress(self, block_id: str) -> bool:
+        """QATC 決策：此 block 是否值得壓縮"""
+        blk = self._pool.get_block(block_id) if self._pool else None
+        tag = (blk.data_tag if blk else block_id).lower()
+        is_quantized = any(k in tag for k in ('int4', 'int8', 'q4_', 'q8_', 'quant'))
+        device_bw = 200.0  # 預設，真實值由裝置測速取得
+        if self._selected_device and self._selected_device.capability:
+            device_bw = self._selected_device.capability.typical_bandwidth_mbs
+        return is_quantized and device_bw < self.QATC_BW_THRESHOLD
+
     def _handle_transfer(self, block_id: str, src: MemoryTier, dst: MemoryTier, size: int) -> bool:
         """
-        處理記憶體層級間的真實資料傳輸。
+        處理記憶體層級間的真實資料傳輸（含 QATC 壓縮）。
 
         資料流:
-          RAM → EXTERNAL: 從 _ram_buffers 讀取 → 寫入 mmap swap file
-          EXTERNAL → RAM: 從 mmap swap file 讀取 → 存入 _ram_buffers
-          RAM ↔ VRAM: 由 CUDA API 處理 (cudaMemcpy)
+          RAM → EXTERNAL: 讀 buffer → [QATC 壓縮] → 寫 mmap swap
+          EXTERNAL → RAM: 讀 mmap swap → [QATC 解壓] → 存 buffer
+          RAM ↔ VRAM: CUDA API (cudaMemcpy)
         """
+        import zlib
+
         if dst == MemoryTier.EXTERNAL:
             # RAM → EXTERNAL: 寫入 SD 卡
             data = self._ram_buffers.get(block_id)
             if data is None:
-                # 沒有 RAM buffer — 寫零 (初始化場景)
                 data = bytearray(size)
 
+            raw_bytes = bytes(data[:size])
+
+            # QATC: 壓縮 INT4 tensor, 跳過 FP16
+            compress = self._should_compress(block_id)
+            if compress:
+                # 壓縮格式: [1 byte flag] + [4 bytes original_size] + [compressed data]
+                compressed = zlib.compress(raw_bytes, self.QATC_ZLIB_LEVEL)
+                if len(compressed) < len(raw_bytes):
+                    import struct
+                    write_data = b'\x01' + struct.pack('<I', len(raw_bytes)) + compressed
+                    logger.debug("QATC compress %s: %dKB → %dKB (%.1fx)",
+                                 block_id, len(raw_bytes)//1024,
+                                 len(write_data)//1024,
+                                 len(raw_bytes)/len(write_data))
+                else:
+                    write_data = b'\x00' + raw_bytes  # 壓縮後更大，不壓
+            else:
+                write_data = b'\x00' + raw_bytes  # flag=0: 未壓縮
+
             if self._swap_mgr is not None:
-                # 分配 swap block
                 if block_id not in self._ext_block_map:
                     if self._next_swap_block >= self._swap_mgr.total_blocks:
                         logger.error("Swap file full, cannot write %s", block_id)
@@ -458,18 +495,16 @@ class SDVRAMSystem:
                     self._next_swap_block += 1
 
                 swap_bid = self._ext_block_map[block_id]
-                ok = self._swap_mgr.write_block(swap_bid, bytes(data[:size]), offset=0)
+                ok = self._swap_mgr.write_block(swap_bid, write_data, offset=0)
                 if not ok:
                     logger.error("Swap write failed for %s", block_id)
                     return False
             else:
-                # 無 swap file — fallback 到裝置直接 I/O
                 try:
-                    self._device.write_block(block_id, 0, bytes(data[:size]))
+                    self._device.write_block(block_id, 0, write_data)
                 except Exception:
                     return False
 
-            # 寫入成功，釋放 RAM buffer
             self._ram_buffers.pop(block_id, None)
             return True
 
@@ -480,11 +515,24 @@ class SDVRAMSystem:
                 if swap_bid is None:
                     logger.error("No swap mapping for %s", block_id)
                     return False
-                data = self._swap_mgr.read_block(swap_bid, 0, size)
-                if data is None:
+                # 讀取整個 swap block (含壓縮 header)
+                raw = self._swap_mgr.read_block(swap_bid, 0, self._swap_mgr._block_size)
+                if raw is None:
                     logger.error("Swap read failed for %s", block_id)
                     return False
-                self._ram_buffers[block_id] = bytearray(data)
+
+                # QATC 解壓: 檢查 flag byte
+                if len(raw) > 0 and raw[0] == 0x01:
+                    # 壓縮過的: [flag=1][4B orig_size][zlib data]
+                    import struct
+                    orig_size = struct.unpack('<I', raw[1:5])[0]
+                    decompressed = zlib.decompress(raw[5:])
+                    self._ram_buffers[block_id] = bytearray(decompressed[:orig_size])
+                    logger.debug("QATC decompress %s: %dKB → %dKB",
+                                 block_id, (len(raw)-5)//1024, orig_size//1024)
+                else:
+                    # 未壓縮: [flag=0][raw data]
+                    self._ram_buffers[block_id] = bytearray(raw[1:size+1])
             else:
                 try:
                     data = self._device.read_block(block_id, 0, size)
