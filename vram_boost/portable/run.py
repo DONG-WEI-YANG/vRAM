@@ -191,6 +191,90 @@ def _print_status(status: HealthStatus):
     sys.stdout.flush()
 
 
+def _check_existing_expansion(drive: str) -> dict | None:
+    """Check if this drive already has an active memory expansion."""
+    system = platform.system()
+    if system == "Windows":
+        import subprocess, json
+        letter = drive[0].upper()
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_PageFileSetting | Select-Object Name | ConvertTo-Json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                data = json.loads(r.stdout)
+                if isinstance(data, dict):
+                    data = [data]
+                for pf in data:
+                    if pf.get("Name", "").upper().startswith(letter + ":"):
+                        return {"path": pf["Name"], "method": "windows_pagefile"}
+        except Exception:
+            pass
+
+        # Check for swap file on drive
+        swap_file = os.path.join(drive, "vram_boost.swap")
+        if os.path.exists(swap_file):
+            size_gb = os.path.getsize(swap_file) / (1024 ** 3)
+            return {"path": swap_file, "method": "swap_file", "size_gb": size_gb}
+    else:
+        swap_file = os.path.join(drive, "vram_boost.swap")
+        if os.path.exists(swap_file):
+            size_gb = os.path.getsize(swap_file) / (1024 ** 3)
+            return {"path": swap_file, "method": "linux_swap", "size_gb": size_gb}
+
+    return None
+
+
+def _do_cleanup(drive: str, existing: dict) -> None:
+    """Remove all vram-boost files from the drive."""
+    print(f"\n  Cleaning up {drive}...")
+
+    # Remove pagefile/swap
+    print(f"  Removing: {existing['path']}")
+    r = remove(drive)
+    if r.success:
+        print(f"  Pagefile/swap removed.")
+        if r.needs_reboot:
+            print(f"  NOTE: Full removal takes effect after reboot.")
+    else:
+        print(f"  Warning: {r.error}")
+        # Try manual removal for swap files
+        if existing["method"] in ("swap_file", "linux_swap"):
+            try:
+                os.unlink(existing["path"])
+                print(f"  Manually deleted: {existing['path']}")
+            except OSError as e:
+                print(f"  Cannot delete: {e}")
+
+    # Remove config file
+    conf = os.path.join(drive, CONFIG_FILE)
+    if os.path.exists(conf):
+        os.unlink(conf)
+        print(f"  Removed: {conf}")
+
+    # Remove .vram directory
+    vram_dir = os.path.join(drive, ".vram")
+    if os.path.isdir(vram_dir):
+        import shutil as _shutil
+        _shutil.rmtree(vram_dir, ignore_errors=True)
+        print(f"  Removed: {vram_dir}/")
+
+    # Show remaining vram-boost files
+    remaining = [f for f in os.listdir(drive) if "vram" in f.lower() and f != "vram-boost.exe"]
+    if remaining:
+        print(f"\n  Remaining files (manual cleanup if needed):")
+        for f in remaining:
+            full = os.path.join(drive, f)
+            size = os.path.getsize(full) if os.path.isfile(full) else 0
+            print(f"    {f} ({size/1024/1024:.1f} MB)")
+    else:
+        print(f"\n  Drive is clean. Only vram-boost.exe remains.")
+
+    print(f"\n  Done! Safe to eject {drive}")
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format=LOG_FMT)
     _print_banner()
@@ -203,9 +287,51 @@ def main():
     total, used, free = shutil.disk_usage(drive)
     print(f"  Capacity: {total/1024**3:.1f} GB, Free: {free/1024**3:.1f} GB")
 
-    # Step 2: Load config
-    config = _load_config(drive)
-    print(f"  Config: max_swap={config['max_swap_percent']}%, auto={config['auto_expand']}")
+    # Step 2: Check if already expanded
+    existing = _check_existing_expansion(drive)
+
+    if existing:
+        print(f"\n  !! This drive already has memory expansion active:")
+        print(f"     {existing['path']}")
+        if "size_gb" in existing:
+            print(f"     Size: {existing['size_gb']:.1f} GB")
+        print()
+        print(f"  Choose:")
+        print(f"    [1] Keep running (monitor only)")
+        print(f"    [2] Remove expansion + clean up")
+        print(f"    [3] Exit")
+        print()
+        choice = input("  > ").strip()
+
+        if choice == "2":
+            if not is_admin():
+                print("\n  Need admin to remove pagefile.")
+                _request_admin_and_relaunch()
+                return
+            _do_cleanup(drive, existing)
+            input("\n  Press Enter to close...")
+            return
+        elif choice == "3":
+            return
+        elif choice == "1":
+            # Fall through to monitor
+            print("\n  Monitoring existing expansion...")
+            mon = Monitor(
+                device_path=drive,
+                swap_path=existing["path"],
+                check_interval_s=5.0,
+                on_status=_print_status,
+                on_disconnect=lambda: print("\n\n  WARNING: Device disconnected!"),
+            )
+            mon.start()
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                mon.stop()
+            return
+        else:
+            return
 
     # Step 3: Speed test + device rating
     print(f"\n  Testing write speed...")
@@ -220,47 +346,60 @@ def main():
     # Step 4: Evaluate
     device = ExternalDevice(
         path=drive,
-        name=f"SD Card ({drive})",
+        name=f"Storage ({drive})",
         bus="SD",
         size_bytes=total,
         free_bytes=free,
     )
     plan = evaluate(device, speed)
-    print(f"\n  Decision: {plan.action}")
-    print(f"  Reason: {plan.reason}")
 
     if plan.action != "expand":
+        print(f"\n  Cannot expand: {plan.reason}")
         input("\n  Press Enter to close...")
         return
 
-    print(f"  Swap size: {plan.swap_gb:.1f} GB")
+    # Step 5: Ask user
+    print(f"\n  Ready to expand:")
+    print(f"    Swap size:  {plan.swap_gb:.1f} GB")
+    print(f"    Free after: {(free - plan.swap_bytes)/1024**3:.1f} GB")
+    print()
+    print(f"  Choose:")
+    print(f"    [1] Expand memory now")
+    print(f"    [2] Exit (no changes)")
+    print()
+    choice = input("  > ").strip()
 
-    # Step 5: Check admin
+    if choice != "1":
+        print("  No changes made.")
+        return
+
+    # Step 6: Check admin
     if not is_admin():
-        print("\n  Administrator privileges required to create swap.")
         _request_admin_and_relaunch()
         return
 
-    # Step 6: Create swap
+    # Step 7: Create swap
     print(f"\n  Creating memory expansion...")
     result = execute(plan)
 
     if result.success:
-        print(f"\n  SUCCESS: {result.method}")
-        print(f"  Path: {result.path}")
-        print(f"  Size: {result.size_gb:.1f} GB")
+        print(f"\n  SUCCESS!")
+        print(f"  Method: {result.method}")
+        print(f"  Path:   {result.path}")
+        print(f"  Size:   {result.size_gb:.1f} GB")
         if result.needs_reboot:
-            print(f"\n  NOTE: Pagefile will be active after REBOOT.")
-            print(f"  After reboot, all programs automatically benefit.")
+            print(f"\n  NOTE: Pagefile active after REBOOT.")
+            print(f"  All programs will benefit automatically.")
         else:
-            print(f"\n  Swap is ACTIVE NOW. All programs benefit.")
+            print(f"\n  Active NOW. All programs benefit.")
+        print(f"\n  To remove later: run this program again and choose [2]")
     else:
         print(f"\n  FAILED: {result.error}")
         input("\n  Press Enter to close...")
         return
 
-    # Step 7: Monitor
-    print(f"\n  Monitoring... (Press Ctrl+C to stop)")
+    # Step 8: Monitor
+    print(f"\n  Monitoring... (Ctrl+C to stop)")
     print()
 
     mon = Monitor(
@@ -276,21 +415,22 @@ def main():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n\n  Stopping...")
+        print("\n\n  Stopping monitor...")
         mon.stop()
 
-    # Ask about removal
+    # Exit menu
     print()
-    ans = input("  Remove swap before ejecting? [Y/n]: ").strip().lower()
-    if ans != "n":
-        print("  Removing swap...")
-        r = remove(drive)
-        if r.success:
-            print("  Swap removed. Safe to eject.")
-        else:
-            print(f"  Warning: {r.error}")
+    print(f"  Choose:")
+    print(f"    [1] Keep expansion active (just close monitor)")
+    print(f"    [2] Remove expansion + clean up before eject")
+    print()
+    choice = input("  > ").strip()
 
-    print("  Done.")
+    if choice == "2":
+        existing = {"path": result.path, "method": result.method}
+        _do_cleanup(drive, existing)
+
+    print("\n  Done.")
 
 
 if __name__ == "__main__":
