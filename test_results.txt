@@ -1,0 +1,48 @@
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.14.0, pytest-9.0.2, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+benchmark: 5.2.3 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: D:\product\vRAM\提升VRAM與GPA效能設計方案
+plugins: anyio-4.12.0, benchmark-5.2.3, mock-3.15.1, asyncio-1.3.0, cov-7.0.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 18 items
+
+tests/test_safety_policy.py::TestPolicyLimits::test_create_policy_limits PASSED [  5%]
+tests/test_safety_policy.py::TestSmartDefaults::test_boundary_128gb_exact PASSED [ 11%]
+tests/test_safety_policy.py::TestSmartDefaults::test_boundary_32gb_exact PASSED [ 16%]
+tests/test_safety_policy.py::TestSmartDefaults::test_large_device_over_128gb PASSED [ 22%]
+tests/test_safety_policy.py::TestSmartDefaults::test_medium_device_32_to_128gb PASSED [ 27%]
+tests/test_safety_policy.py::TestSmartDefaults::test_small_device_under_32gb PASSED [ 33%]
+tests/test_safety_policy.py::TestSmartDefaults::test_system_ram_reserve_is_set PASSED [ 38%]
+tests/test_safety_policy.py::TestConfigMerge::test_device_override_wins_over_global PASSED [ 44%]
+tests/test_safety_policy.py::TestConfigMerge::test_global_override_replaces_smart_default PASSED [ 50%]
+tests/test_safety_policy.py::TestConfigMerge::test_no_config_files_uses_smart_defaults PASSED [ 55%]
+tests/test_safety_policy.py::TestConfigMerge::test_save_device_override PASSED [ 61%]
+tests/test_safety_policy.py::TestConfigMerge::test_save_global_policy PASSED [ 66%]
+tests/test_safety_policy.py::TestValidation::test_exact_boundary_max PASSED [ 72%]
+tests/test_safety_policy.py::TestValidation::test_exact_boundary_min PASSED [ 77%]
+tests/test_safety_policy.py::TestValidation::test_reject_above_max PASSED [ 83%]
+tests/test_safety_policy.py::TestValidation::test_reject_below_min PASSED [ 88%]
+tests/test_safety_policy.py::TestValidation::test_reject_insufficient_device_space FAILED [ 94%]
+tests/test_safety_policy.py::TestValidation::test_valid_activation PASSED [100%]
+
+================================== FAILURES ===================================
+____________ TestValidation.test_reject_insufficient_device_space _____________
+
+self = <tests.test_safety_policy.TestValidation testMethod=test_reject_insufficient_device_space>
+
+    def test_reject_insufficient_device_space(self):
+        ok, reason = SafetyPolicy.validate_activation(64.0, 62.0, self.policy)
+        self.assertFalse(ok)
+>       self.assertIn("reserved", reason.lower())
+E       AssertionError: 'reserved' not found in 'requested 62.0 gb exceeds max (25.0 gb)'
+
+tests\test_safety_policy.py:193: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_safety_policy.py::TestValidation::test_reject_insufficient_device_space
+======================== 1 failed, 17 passed in 0.13s =========================
+
+STDERR:
+
+RETURN CODE: 1
