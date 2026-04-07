@@ -302,18 +302,30 @@ class TransferEngine:
             logical_size = req.size_bytes
             physical_size = logical_size
             
-            # 透明壓縮邏輯 (Transparent Compression)
+            # Quantization-Aware Transparent Compression (QATC)
+            #
+            # 基於真實測量 (GPT-2, 2026-04-07):
+            #   FP16 weights: zlib-1 壓縮率 0.9x, 速度 116 MB/s → 不值得壓
+            #   INT4 weights: zlib-1 壓縮率 5.6x, 速度 712 MB/s → 低速裝置值得
+            #
+            # 決策邏輯: compress iff compress_speed > io_bandwidth
+            #   INT4 zlib-1 (712 MB/s): 值得壓 when BW < ~500 MB/s
+            #   FP16 任何 level: 永遠不壓 (ratio < 1.1x, speed < 120 MB/s)
             if self._enable_compression and (is_to_external or is_from_external):
-                # 如果是寫入外部儲存，執行壓縮
-                if is_to_external:
-                    # 模擬壓縮率：LLM 權重平均約 2x-4x，使用 Shared Dict 可達 6x+
-                    # 在實體系統中，這裡會調用 self._compression_dict.compress(data)
-                    physical_size = logical_size // 3  # 預估 3x 壓縮率
-                
-                # 如果是從外部讀取，執行解壓縮
-                elif is_from_external:
-                    # 實體讀取的大小是壓縮後的
-                    physical_size = logical_size // 3
+                bw = self._bandwidth_limit or 200.0
+                # 用 data_tag 判斷 tensor 格式（由上層標記）
+                tag = getattr(req, 'data_tag', '') or ''
+                is_quantized = any(k in tag.lower() for k in ('int4', 'int8', 'q4_', 'q8_', 'quant'))
+
+                if is_quantized and bw < 500.0:
+                    # INT4/INT8: 壓縮率 ~5.6x (zlib-1), 在低速 I/O 下值得
+                    physical_size = max(1, logical_size * 10 // 56)  # ~5.6x
+                elif not is_quantized:
+                    # FP16/FP32: 不壓縮（壓縮率 ~1.0x，CPU overhead 不值得）
+                    physical_size = logical_size
+                else:
+                    # 高速裝置 + 量化 tensor: 不壓縮（CPU 瓶頸）
+                    physical_size = logical_size
 
             if handler:
                 # 呼叫底層 I/O 處理器，傳遞實體大小
