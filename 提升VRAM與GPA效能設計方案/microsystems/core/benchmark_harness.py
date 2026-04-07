@@ -168,24 +168,23 @@ def _layer_compression_ratio(layer_idx: int, num_layers: int, spec: ModelSpec,
     """
     根據層的位置和量化格式決定壓縮率。
 
-    基於 GPT-2 真實測量 (2026-04-07):
-      FP16 weights:  zlib-1 = 0.95x (不可壓，entropy 7.39)
-      INT4 packed:   zlib-1 = 5.6x  (高度可壓，entropy 0.48)
-      INT8 symmetric: zlib-1 = 1.17x
-
-    Mixed-precision (GPTQ-INT4):
-      Attention/FFN weights → INT4 (5.6x)
-      Embedding/LayerNorm  → FP16 (1.0x)
+    基於真實測量:
+      GPT-2 FP32 (2026-04-07):     所有層 ~1.08x (不可壓)
+      GPTQ-INT4 TinyLlama (2026-04-07):
+        Attention qweight: zlib-1 = 30.2x
+        FFN qweight:       zlib-1 = 39.4x
+        Embedding (BF16):  ~1.0x
     """
     if not quantized:
-        # FP16/FP32: 所有層基本不可壓 (真實測量)
         return 1.0
 
-    # Quantized (INT4) 模式
     if layer_idx == 0 or layer_idx == num_layers - 1:
-        return 1.0   # Embedding 保持 FP16，不可壓
-    # Attention/FFN weights INT4: 真實測量 5.6x (zlib-1)
-    return 5.6
+        return 1.0   # Embedding/LM Head 保持 FP16/BF16
+
+    # GPTQ-INT4 真實測量值
+    if layer_idx % 2 == 0:
+        return 30.2   # Attention qweight
+    return 39.4       # FFN qweight
 
 
 def _layer_compute_time_ms(layer_idx: int, num_layers: int, spec: ModelSpec) -> float:

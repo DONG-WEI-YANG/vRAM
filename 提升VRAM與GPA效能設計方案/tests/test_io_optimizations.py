@@ -263,8 +263,8 @@ class TestTransferEngineCompression(unittest.TestCase):
         engine._execute_transfer(req)
 
         self.assertEqual(len(handler_calls), 1)
-        # QATC: INT4 at BW < 500 → physical = logical * 10 // 56 (~5.6x)
-        expected_physical = max(1, logical_size * 10 // 56)
+        # QATC: INT4 at BW < 500 → physical = logical // 30 (~30x, real GPTQ measurement)
+        expected_physical = max(1, logical_size // 30)
         self.assertEqual(handler_calls[0], expected_physical,
                          f"Physical size should be {expected_physical}, "
                          f"got {handler_calls[0]}")
@@ -292,7 +292,7 @@ class TestTransferEngineCompression(unittest.TestCase):
         req.data_tag = "int4_weight_layer_5"
         engine._execute_transfer(req)
 
-        expected_physical = max(1, logical_size * 10 // 56)
+        expected_physical = max(1, logical_size // 30)
         self.assertEqual(handler_calls[0], expected_physical)
 
     def test_no_compression_for_vram_to_ram(self):

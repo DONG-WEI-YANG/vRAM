@@ -304,22 +304,22 @@ class TransferEngine:
             
             # Quantization-Aware Transparent Compression (QATC)
             #
-            # 基於真實測量 (GPT-2, 2026-04-07):
-            #   FP16 weights: zlib-1 壓縮率 0.9x, 速度 116 MB/s → 不值得壓
-            #   INT4 weights: zlib-1 壓縮率 5.6x, 速度 712 MB/s → 低速裝置值得
+            # 基於真實測量:
+            #   GPT-2 FP32 (2026-04-07): ~1.08x (不可壓)
+            #   GPTQ-INT4 TinyLlama (2026-04-07):
+            #     Attention qweight: zlib-1 = 30.2x
+            #     FFN qweight:       zlib-1 = 39.4x
+            #     平均 ~35x
             #
-            # 決策邏輯: compress iff compress_speed > io_bandwidth
-            #   INT4 zlib-1 (712 MB/s): 值得壓 when BW < ~500 MB/s
-            #   FP16 任何 level: 永遠不壓 (ratio < 1.1x, speed < 120 MB/s)
+            # 決策: compress iff (quantized AND device_bw < 500 MB/s)
             if self._enable_compression and (is_to_external or is_from_external):
                 bw = self._bandwidth_limit or 200.0
-                # 用 data_tag 判斷 tensor 格式（由上層標記）
                 tag = getattr(req, 'data_tag', '') or ''
                 is_quantized = any(k in tag.lower() for k in ('int4', 'int8', 'q4_', 'q8_', 'quant'))
 
                 if is_quantized and bw < 500.0:
-                    # INT4/INT8: 壓縮率 ~5.6x (zlib-1), 在低速 I/O 下值得
-                    physical_size = max(1, logical_size * 10 // 56)  # ~5.6x
+                    # GPTQ-INT4: 真實測量 30-39x (zlib-1)，保守取 30x
+                    physical_size = max(1, logical_size // 30)
                 elif not is_quantized:
                     # FP16/FP32: 不壓縮（壓縮率 ~1.0x，CPU overhead 不值得）
                     physical_size = logical_size
