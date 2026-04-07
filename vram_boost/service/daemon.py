@@ -31,10 +31,10 @@ from vram_boost.core.measure import measure_write_speed
 from vram_boost.core.policy import evaluate
 from vram_boost.core.extend import execute, is_admin, remove
 from vram_boost.core.monitor import Monitor
+from vram_boost.core.hotplug import HotplugWatcher, HotplugEvent, DeviceChange
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 5.0  # seconds between device scans
 STATE_FILE = os.path.expanduser("~/.vram-boost/state.json")
 
 
@@ -46,26 +46,49 @@ class Daemon:
         self._managed: Dict[str, Monitor] = {}  # path → Monitor
         self._known_paths: Set[str] = set()
         self._lock = threading.Lock()
+        self._watcher: Optional[HotplugWatcher] = None
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
         """Main daemon loop. Blocks until stopped."""
         self._active = True
-        logger.info("vram-boost daemon started (poll=%ds)", POLL_INTERVAL)
+        logger.info("vram-boost daemon started (event-driven)")
 
-        # Initial scan
+        # Initial scan for existing devices
         self._scan_and_expand()
 
-        # Poll loop
-        while self._active:
-            time.sleep(POLL_INTERVAL)
-            self._scan_and_expand()
+        # Start hotplug event watcher
+        self._watcher = HotplugWatcher(on_change=self._on_hotplug)
+        self._watcher.start()
+
+        # Block until stopped
+        self._stop_event.wait()
 
         # Cleanup
+        if self._watcher:
+            self._watcher.stop()
         self._cleanup_all()
         logger.info("Daemon stopped")
 
     def stop(self) -> None:
         self._active = False
+        self._stop_event.set()
+
+    def _on_hotplug(self, change: DeviceChange) -> None:
+        """Handle hotplug events from watcher."""
+        if change.event == HotplugEvent.ARRIVED:
+            logger.info("Hotplug: device arrived %s", change.path)
+            # Give OS a moment to mount
+            time.sleep(1)
+            devices = detect_devices()
+            for d in devices:
+                if d.path == change.path and d.path not in self._known_paths:
+                    self._try_expand(d)
+                    self._known_paths.add(d.path)
+
+        elif change.event == HotplugEvent.REMOVED:
+            logger.info("Hotplug: device removed %s", change.path)
+            self._teardown(change.path)
 
     def status(self) -> dict:
         with self._lock:
