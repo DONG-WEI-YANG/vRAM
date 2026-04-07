@@ -27,6 +27,7 @@ Enclosure-VRAM Booster Micro-System
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
@@ -60,7 +61,10 @@ class EnclosurePerformanceEstimate:
     can_run_405b: bool
 
 
-class EnclosureVRAMSystem:
+from ._transfer_mixin import TransferHandlerMixin
+
+
+class EnclosureVRAMSystem(TransferHandlerMixin):
     """
     Enclosure-VRAM Booster 完整微系統。
 
@@ -87,6 +91,7 @@ class EnclosureVRAMSystem:
         self._ram_bytes: int = 0
         self._start_time: float = 0.0
         self._tb_version: str = ""
+        self._init_transfer_infra()
 
     # ── Lifecycle ──
 
@@ -153,8 +158,11 @@ class EnclosureVRAMSystem:
             return False
 
         ext_bytes = self._device.available_bytes
-        ram_pool = min(self._ram_bytes // 2, 48 * (1024**3))  # 外接盒方案可用更多 RAM
+        ram_pool = min(self._ram_bytes // 2, 48 * (1024**3))
         cap = self._device.capability
+
+        # 1b. 建立 mmap swap file
+        self._setup_swap_file(self._selected_device.device_path, ext_bytes)
 
         # 2. 記憶體池（外接盒頻寬高，可以更積極地使用外部層）
         self._pool = MemoryPool(
@@ -352,8 +360,7 @@ class EnclosureVRAMSystem:
 
     # ── Internal ──
 
-    def _handle_transfer(self, block_id: str, src: MemoryTier, dst: MemoryTier, size: int) -> bool:
-        return True
+    # _handle_transfer inherited from TransferHandlerMixin
 
     def _handle_migration(self, block_id: str, src: MemoryTier, dst: MemoryTier) -> bool:
         blk = self._pool.get_block(block_id) if self._pool else None

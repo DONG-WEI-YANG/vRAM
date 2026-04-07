@@ -23,6 +23,7 @@ USB-VRAM Booster Micro-System
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -63,7 +64,10 @@ class USBPerformanceEstimate:
     feasibility: str
 
 
-class USBVRAMSystem:
+from ._transfer_mixin import TransferHandlerMixin
+
+
+class USBVRAMSystem(TransferHandlerMixin):
     """
     USB-VRAM Booster 完整微系統。
 
@@ -102,6 +106,7 @@ class USBVRAMSystem:
         self._vram_bytes: int = 0
         self._ram_bytes: int = 0
         self._start_time: float = 0.0
+        self._init_transfer_infra()
 
     # ── Public Lifecycle ──
 
@@ -179,6 +184,9 @@ class USBVRAMSystem:
         ext_bytes = self._device.available_bytes
         ram_pool = min(self._ram_bytes // 2, 32 * (1024**3))
         cap = self._device.capability
+
+        # 2b. 建立 mmap swap file
+        self._setup_swap_file(self._selected_device.device_path, ext_bytes)
 
         # 3. 記憶體池
         self._pool = MemoryPool(
@@ -366,13 +374,7 @@ class USBVRAMSystem:
         cap = USBStorageDevice._resolve_capability(dev.protocol)
         return cap.typical_bandwidth_mbs
 
-    def _handle_transfer(self, block_id: str, src: MemoryTier, dst: MemoryTier, size: int) -> bool:
-        if src == MemoryTier.EXTERNAL or dst == MemoryTier.EXTERNAL:
-            try:
-                return True
-            except Exception:
-                return False
-        return True
+    # _handle_transfer inherited from TransferHandlerMixin
 
     def _handle_migration(self, block_id: str, src: MemoryTier, dst: MemoryTier) -> bool:
         blk = self._pool.get_block(block_id) if self._pool else None

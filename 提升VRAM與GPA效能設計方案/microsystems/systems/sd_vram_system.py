@@ -34,6 +34,7 @@ from ..core.prefetcher import PredictivePrefetcher, PrefetchStrategy, LayerProfi
 from ..core.health_monitor import HealthMonitor, AlertLevel
 from ..devices.sd_express import SDExpressDevice
 from ..devices.base_device import DeviceInfo
+from ._transfer_mixin import TransferHandlerMixin
 from ..config import SystemConfig, BoostMode, MODEL_PROFILES
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ class PerformanceEstimate:
     feasibility: str              # "optimal" / "acceptable" / "slow" / "infeasible"
 
 
-class SDVRAMSystem:
+class SDVRAMSystem(TransferHandlerMixin):
     """
     SD-VRAM Booster 完整微系統。
 
@@ -80,14 +81,8 @@ class SDVRAMSystem:
         self._ram_bytes: int = 0
         self._start_time: float = 0.0
 
-        # ── 真實資料搬移基礎設施 ──
-        from ..core.mmap_swap import SwapFileManager
-        self._swap_mgr: Optional[SwapFileManager] = None
-        # RAM 層的 tensor buffer: block_id → bytearray
-        self._ram_buffers: Dict[str, bytearray] = {}
-        # block_id → swap block index 映射
-        self._ext_block_map: Dict[str, int] = {}
-        self._next_swap_block: int = 0
+        # 真實資料搬移基礎設施 (from TransferHandlerMixin)
+        self._init_transfer_infra()
 
     # ── Public Lifecycle API ──
 
@@ -165,31 +160,7 @@ class SDVRAMSystem:
         ext_bytes = self._device.available_bytes
 
         # 1b. 在 SD 卡上建立 mmap swap file
-        device_path = self._selected_device.device_path
-        if device_path and os.path.isdir(device_path.rstrip("\\")):
-            swap_dir = device_path.rstrip("\\")
-        else:
-            swap_dir = None
-
-        if swap_dir:
-            from ..core.mmap_swap import SwapFileManager
-            swap_path = os.path.join(swap_dir, "vram_boost.swap")
-            # 使用 80% 的可用空間，64MB block size
-            swap_size = int(ext_bytes * 0.8)
-            block_size = 64 * 1024 * 1024  # 64 MB
-            try:
-                self._swap_mgr = SwapFileManager(block_size=block_size)
-                self._swap_mgr.create(swap_path, swap_size)
-                self._swap_mgr.open()
-                # 預先映射所有 block
-                for bid in range(self._swap_mgr.total_blocks):
-                    self._swap_mgr.map_block(bid)
-                logger.info("Swap file ready: %s (%d blocks of %dMB)",
-                            swap_path, self._swap_mgr.total_blocks,
-                            block_size // (1024 * 1024))
-            except Exception as e:
-                logger.warning("Failed to create swap file: %s", e)
-                self._swap_mgr = None
+        self._setup_swap_file(self._selected_device.device_path, ext_bytes)
 
         # 2. 建立三層記憶體池
         ram_pool = min(self._ram_bytes // 2, 32 * (1024**3))  # 最多用 50% RAM 或 32GB
@@ -432,117 +403,8 @@ class SDVRAMSystem:
 
     # ── Internal Handlers ──
 
-    # ── QATC: Quantization-Aware Transparent Compression ──
-    # 基於真實測量 (GPT-2, 2026-04-07):
-    #   INT4 zlib-1: ratio=5.6x, speed=712MB/s → 低速裝置值得壓
-    #   FP16 zlib-1: ratio=0.95x, speed=116MB/s → 永遠不壓
-    # 決策: compress iff (is_quantized AND device_bw < 500MB/s)
-    QATC_BW_THRESHOLD = 500.0  # MB/s
-    QATC_ZLIB_LEVEL = 1        # 最快壓縮
-
-    def _should_compress(self, block_id: str) -> bool:
-        """QATC 決策：此 block 是否值得壓縮"""
-        blk = self._pool.get_block(block_id) if self._pool else None
-        tag = (blk.data_tag if blk else block_id).lower()
-        is_quantized = any(k in tag for k in ('int4', 'int8', 'q4_', 'q8_', 'quant'))
-        device_bw = 200.0  # 預設，真實值由裝置測速取得
-        if self._selected_device and self._selected_device.capability:
-            device_bw = self._selected_device.capability.typical_bandwidth_mbs
-        return is_quantized and device_bw < self.QATC_BW_THRESHOLD
-
-    def _handle_transfer(self, block_id: str, src: MemoryTier, dst: MemoryTier, size: int) -> bool:
-        """
-        處理記憶體層級間的真實資料傳輸（含 QATC 壓縮）。
-
-        資料流:
-          RAM → EXTERNAL: 讀 buffer → [QATC 壓縮] → 寫 mmap swap
-          EXTERNAL → RAM: 讀 mmap swap → [QATC 解壓] → 存 buffer
-          RAM ↔ VRAM: CUDA API (cudaMemcpy)
-        """
-        import zlib
-
-        if dst == MemoryTier.EXTERNAL:
-            # RAM → EXTERNAL: 寫入 SD 卡
-            data = self._ram_buffers.get(block_id)
-            if data is None:
-                data = bytearray(size)
-
-            raw_bytes = bytes(data[:size])
-
-            # QATC: 壓縮 INT4 tensor, 跳過 FP16
-            compress = self._should_compress(block_id)
-            if compress:
-                # 壓縮格式: [1 byte flag] + [4 bytes original_size] + [compressed data]
-                compressed = zlib.compress(raw_bytes, self.QATC_ZLIB_LEVEL)
-                if len(compressed) < len(raw_bytes):
-                    import struct
-                    write_data = b'\x01' + struct.pack('<I', len(raw_bytes)) + compressed
-                    logger.debug("QATC compress %s: %dKB → %dKB (%.1fx)",
-                                 block_id, len(raw_bytes)//1024,
-                                 len(write_data)//1024,
-                                 len(raw_bytes)/len(write_data))
-                else:
-                    write_data = b'\x00' + raw_bytes  # 壓縮後更大，不壓
-            else:
-                write_data = b'\x00' + raw_bytes  # flag=0: 未壓縮
-
-            if self._swap_mgr is not None:
-                if block_id not in self._ext_block_map:
-                    if self._next_swap_block >= self._swap_mgr.total_blocks:
-                        logger.error("Swap file full, cannot write %s", block_id)
-                        return False
-                    self._ext_block_map[block_id] = self._next_swap_block
-                    self._next_swap_block += 1
-
-                swap_bid = self._ext_block_map[block_id]
-                ok = self._swap_mgr.write_block(swap_bid, write_data, offset=0)
-                if not ok:
-                    logger.error("Swap write failed for %s", block_id)
-                    return False
-            else:
-                try:
-                    self._device.write_block(block_id, 0, write_data)
-                except Exception:
-                    return False
-
-            self._ram_buffers.pop(block_id, None)
-            return True
-
-        elif src == MemoryTier.EXTERNAL:
-            # EXTERNAL → RAM: 從 SD 卡讀取
-            if self._swap_mgr is not None:
-                swap_bid = self._ext_block_map.get(block_id)
-                if swap_bid is None:
-                    logger.error("No swap mapping for %s", block_id)
-                    return False
-                # 讀取整個 swap block (含壓縮 header)
-                raw = self._swap_mgr.read_block(swap_bid, 0, self._swap_mgr._block_size)
-                if raw is None:
-                    logger.error("Swap read failed for %s", block_id)
-                    return False
-
-                # QATC 解壓: 檢查 flag byte
-                if len(raw) > 0 and raw[0] == 0x01:
-                    # 壓縮過的: [flag=1][4B orig_size][zlib data]
-                    import struct
-                    orig_size = struct.unpack('<I', raw[1:5])[0]
-                    decompressed = zlib.decompress(raw[5:])
-                    self._ram_buffers[block_id] = bytearray(decompressed[:orig_size])
-                    logger.debug("QATC decompress %s: %dKB → %dKB",
-                                 block_id, (len(raw)-5)//1024, orig_size//1024)
-                else:
-                    # 未壓縮: [flag=0][raw data]
-                    self._ram_buffers[block_id] = bytearray(raw[1:size+1])
-            else:
-                try:
-                    data = self._device.read_block(block_id, 0, size)
-                    self._ram_buffers[block_id] = bytearray(data) if data else bytearray(size)
-                except Exception:
-                    return False
-            return True
-
-        # RAM ↔ VRAM: CUDA API 處理
-        return True
+    # _handle_transfer, _should_compress, QATC constants
+    # all inherited from TransferHandlerMixin
 
     def _handle_migration(self, block_id: str, src: MemoryTier, dst: MemoryTier) -> bool:
         """MemoryPool 的遷移回調"""
