@@ -47,29 +47,111 @@ class TransferHandlerMixin:
         self._ram_buffers: Dict[str, bytearray] = {}
         self._ext_block_map: Dict[str, int] = {}
         self._next_swap_block: int = 0
+        self._measured_write_mbs: float = 0.0
+
+    @staticmethod
+    def _measure_device_speed(path: str, test_size_mb: int = 4) -> float:
+        """
+        測量裝置的 sequential write 速度 (MB/s)。
+
+        用 4MB random data 寫入測試，取兩次的平均值。
+        """
+        import time as _time
+        test_file = os.path.join(path, ".vram_speed_test")
+        block = os.urandom(test_size_mb * 1024 * 1024)
+        speeds = []
+        try:
+            for _ in range(2):
+                fd = os.open(test_file, os.O_CREAT | os.O_RDWR | os.O_BINARY | os.O_TRUNC)
+                t0 = _time.perf_counter()
+                os.write(fd, block)
+                os.fsync(fd)
+                t1 = _time.perf_counter()
+                os.close(fd)
+                speeds.append(test_size_mb / max(t1 - t0, 0.001))
+        except Exception as e:
+            logger.warning("Speed test failed on %s: %s", path, e)
+            return 25.0  # 保守預設
+        finally:
+            try:
+                os.unlink(test_file)
+            except OSError:
+                pass
+        return sum(speeds) / len(speeds) if speeds else 25.0
+
+    @staticmethod
+    def _auto_tune_params(write_speed_mbs: float, capacity_bytes: int) -> dict:
+        """
+        根據裝置測速結果自動調整參數。
+
+        基於真實測量的調度策略：
+          < 30 MB/s (UHS-I):   16MB block, 2 workers
+          30-100 MB/s (UHS-II): 32MB block, 2 workers
+          100-500 MB/s (USB):   64MB block, 4 workers
+          > 500 MB/s (NVMe):   64MB block, 8 workers
+        """
+        GB = 1024 ** 3
+
+        if write_speed_mbs < 30:
+            block_size = 16 * 1024 * 1024
+            workers = 2
+        elif write_speed_mbs < 100:
+            block_size = 32 * 1024 * 1024
+            workers = 2
+        elif write_speed_mbs < 500:
+            block_size = 64 * 1024 * 1024
+            workers = 4
+        else:
+            block_size = 64 * 1024 * 1024
+            workers = 8
+
+        # Swap size: min(speed × 600s, 80% capacity)
+        swap_by_speed = int(write_speed_mbs * 600 * 1024 * 1024)
+        swap_by_capacity = int(capacity_bytes * 0.8)
+        swap_size = min(swap_by_speed, swap_by_capacity)
+
+        return {
+            "block_size": block_size,
+            "workers": workers,
+            "swap_size": swap_size,
+            "compress": write_speed_mbs < 500,
+        }
 
     def _setup_swap_file(
         self,
         device_path: str,
         total_bytes: int,
         use_percent: float = 0.8,
-        block_size: int = 64 * 1024 * 1024,
+        block_size: int = 0,
     ) -> bool:
         """
-        在外部裝置上建立 mmap swap file。在 activate() 中呼叫。
+        在外部裝置上建立 mmap swap file（含自動調參）。
 
+        如果 block_size=0，自動測速並調整 block_size、swap_size。
         Returns: True if swap file created successfully.
         """
-        # 取得可寫目錄
         swap_dir = device_path.rstrip("\\").rstrip("/")
         if not os.path.isdir(swap_dir):
-            # device_path 可能是 raw device path (\\.\PhysicalDrive1)
-            # 在這種情況下無法建立 swap file
             logger.warning("Cannot create swap file on raw device: %s", device_path)
             return False
 
+        # 自動測速 + 調參
+        if block_size == 0:
+            self._measured_write_mbs = self._measure_device_speed(swap_dir)
+            params = self._auto_tune_params(self._measured_write_mbs, total_bytes)
+            block_size = params["block_size"]
+            swap_size = params["swap_size"]
+            logger.info(
+                "Auto-tuned: speed=%.1f MB/s → block=%dMB, workers=%d, swap=%.1fGB",
+                self._measured_write_mbs,
+                block_size // (1024 * 1024),
+                params["workers"],
+                swap_size / (1024 ** 3),
+            )
+        else:
+            swap_size = int(total_bytes * use_percent)
+
         swap_path = os.path.join(swap_dir, SWAP_FILENAME)
-        swap_size = int(total_bytes * use_percent)
 
         try:
             self._swap_mgr = SwapFileManager(block_size=block_size)
