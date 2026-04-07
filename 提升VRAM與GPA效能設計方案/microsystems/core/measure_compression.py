@@ -213,21 +213,45 @@ def measure_model(
                 if max_tensors > 0 and tensor_count >= max_tensors:
                     break
 
-                tensor = f.get_tensor(tensor_name)
-                tensor_bytes = tensor.tobytes()
+                try:
+                    tensor = f.get_tensor(tensor_name)
+                    tensor_bytes = tensor.tobytes()
+                    shape = tensor.shape
+                    dtype = str(tensor.dtype)
+                except (TypeError, ValueError):
+                    # Handle unsupported dtypes (e.g., bfloat16)
+                    # Read raw bytes via slice
+                    tensor_slice = f.get_slice(tensor_name)
+                    shape = tuple(tensor_slice.get_shape())
+                    dtype = str(tensor_slice.get_dtype())
+                    # Calculate byte size from shape and dtype
+                    elem_size = {"I32": 4, "I16": 2, "I8": 1, "F32": 4,
+                                 "F16": 2, "BF16": 2, "F64": 8, "U8": 1,
+                                 "BOOL": 1}.get(dtype, 2)
+                    n_elems = 1
+                    for d in shape:
+                        n_elems *= d
+                    total_bytes = n_elems * elem_size
+                    # Read via numpy with fallback dtype
+                    try:
+                        tensor = tensor_slice[:].view(np.uint8)
+                        tensor_bytes = tensor.tobytes()
+                    except Exception:
+                        # Last resort: skip
+                        logger.warning("Skipping %s (unsupported dtype %s)", tensor_name, dtype)
+                        continue
 
-                # Skip tiny tensors (norms, biases < 1KB)
                 if len(tensor_bytes) < 1024:
                     continue
 
                 logger.info(
                     "  [%d] %s  shape=%s  dtype=%s  %.2f MB",
-                    tensor_count, tensor_name, tensor.shape,
-                    tensor.dtype, len(tensor_bytes) / MB,
+                    tensor_count, tensor_name, shape,
+                    dtype, len(tensor_bytes) / MB,
                 )
 
                 result = measure_single_tensor(
-                    tensor_bytes, tensor_name, tensor.shape, str(tensor.dtype),
+                    tensor_bytes, tensor_name, shape, dtype,
                 )
                 all_results.append(result)
                 tensor_count += 1
