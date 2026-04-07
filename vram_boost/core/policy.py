@@ -41,11 +41,11 @@ def evaluate(device: ExternalDevice, speed: SpeedResult) -> ExpansionPlan:
       - free < 512 MB → skip (too small)
       - otherwise → expand with auto-tuned params
     """
-    # Too slow
-    if speed.write_mbs < 1.0:
+    # Too slow — read speed is what matters for actual use
+    if speed.read_mbs < 1.0:
         return ExpansionPlan(
             device=device, speed=speed, action="too_slow",
-            reason=f"Write speed {speed.write_mbs:.1f} MB/s below minimum 1 MB/s",
+            reason=f"Read speed {speed.read_mbs:.1f} MB/s below minimum 1 MB/s",
         )
 
     # Too small
