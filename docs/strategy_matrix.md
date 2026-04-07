@@ -4,7 +4,7 @@
 
 ## Hardware Measured
 
-| Device | Type | Seq Write | QATC ×30 | Cost |
+| Device | Type | Seq Write | quantization-aware compression ×30 | Cost |
 |--------|------|-----------|----------|------|
 | USB Flash 117GB | USB 2.0 | 2.5 MB/s | 76 MB/s | ~$10 |
 | USB SSD 469GB | USB 3.0 | 13.0 MB/s | 389 MB/s | ~$30 |
@@ -29,7 +29,7 @@
 Assumptions:
 - Offload overhead ∝ 1/bandwidth
 - SD offload measured: 0.34 tok/s @ 21.7 MB/s
-- QATC compression: 30× on GPTQ-INT4 weights (real measurement)
+- quantization-aware compression compression: 30× on GPTQ-INT4 weights (real measurement)
 - INT4 model is 4× smaller → 4× less data to offload
 
 ```
@@ -40,38 +40,38 @@ FP16 (no compress)    0.04        0.20       0.34       0.71        12.5        
 FP16 + CPU hybrid     0.10        0.50       0.85       1.74        13.0         7.64
 INT4 (no offload)     —           —          —          —           —           16.39
 INT4 + offload        0.16        0.81       1.38       2.84        16.0        16.39
-INT4 + QATC           4.72       13.0*       16.0*      16.0*       16.0*       16.39
+INT4 + quantization-aware compression           4.72       13.0*       16.0*      16.0*       16.0*       16.39
 ─────────────────────────────────────────────────────────────────────────────────────────
 
 ★ = Recommended strategy per device class
-* = QATC effective bandwidth exceeds GPU compute bottleneck → same as pure GPU
+* = compressed effective bandwidth exceeds GPU compute bottleneck → same as pure GPU
 ```
 
 ### Recommended Strategy per Device
 
 | Device Speed | Best Strategy | Expected tok/s | Why |
 |-------------|---------------|----------------|-----|
-| < 10 MB/s | INT4 + QATC | ~5 tok/s | Compression transforms 2.5→76 MB/s |
-| 10-50 MB/s | INT4 + QATC | ~13-16 tok/s | Effective BW reaches GPU bottleneck |
-| 50-500 MB/s | INT4 + QATC | ~16 tok/s | Compute-bound, not I/O-bound |
+| < 10 MB/s | INT4 + quantization-aware compression | ~5 tok/s | Compression transforms 2.5→76 MB/s |
+| 10-50 MB/s | INT4 + quantization-aware compression | ~13-16 tok/s | Effective BW reaches GPU bottleneck |
+| 50-500 MB/s | INT4 + quantization-aware compression | ~16 tok/s | Compute-bound, not I/O-bound |
 | > 500 MB/s | INT4 (no compress) | ~16 tok/s | Compression CPU overhead > I/O benefit |
 
 ### Key Insight
 
 ```
-                        Without QATC        With QATC (30×)
+                        Without quantization-aware compression        With quantization-aware compression (30×)
 USB Flash (2.5 MB/s):   0.04 tok/s    →     4.72 tok/s    (118× faster)
 SD UHS-I (22 MB/s):     0.34 tok/s    →    16.0  tok/s    (47× faster)
 SD UHS-II (45 MB/s):    0.71 tok/s    →    16.0  tok/s    (23× faster)
 ```
 
-QATC makes every device usable. Without it, only SD Express (800 MB/s) is practical.
+quantization-aware compression makes every device usable. Without it, only SD Express (800 MB/s) is practical.
 
 ## Model Size × Device Capacity Matrix
 
-### Can it fit? (GPTQ-INT4 compressed with QATC)
+### Can it fit? (GPTQ-INT4 compressed with quantization-aware compression)
 
-| Model | Raw FP16 | INT4 | INT4+QATC | USB 117GB | SD 58GB | SD 500GB |
+| Model | Raw FP16 | INT4 | INT4 + compression | USB 117GB | SD 58GB | SD 500GB |
 |-------|----------|------|-----------|-----------|---------|----------|
 | TinyLlama 1.1B | 2.2 GB | 0.6 GB | 0.02 GB | ✓ | ✓ | ✓ |
 | Phi-3-mini 3.8B | 7.3 GB | 2.1 GB | 0.07 GB | ✓ | ✓ | ✓ |
@@ -80,11 +80,11 @@ QATC makes every device usable. Without it, only SD Express (800 MB/s) is practi
 | Mixtral 8×7B | 93 GB | 24 GB | 0.80 GB | ✓ | ✓ | ✓ |
 | Llama-3-405B | 810 GB | 203 GB | 6.8 GB | ✓ | ✓ | ✓ |
 
-**With INT4+QATC, even 405B fits on a 58GB SD card (6.8GB compressed).**
+**With INT4 + compression, even 405B fits on a 58GB SD card (6.8GB compressed).**
 
 ## Load Time Estimate
 
-| Model (INT4+QATC) | Compressed | USB 2.5MB/s | SD 22MB/s | SD 45MB/s |
+| Model (INT4 + compression) | Compressed | USB 2.5MB/s | SD 22MB/s | SD 45MB/s |
 |--------------------|-----------|-------------|-----------|-----------|
 | Llama-3-8B | 0.15 GB | 61 sec | 7 sec | 3 sec |
 | Llama-3-70B | 1.17 GB | 7.8 min | 53 sec | 26 sec |
@@ -99,7 +99,7 @@ def recommend_strategy(device_speed_mbs, model_size_gb, vram_gb):
         return "INT4 pure GPU"  # Best: no offload needed
     
     if device_speed_mbs < 500:
-        return "INT4 + QATC offload"  # Compress quantized weights
+        return "INT4 + quantization-aware compression offload"  # Compress quantized weights
     else:
         return "INT4 offload (no compress)"  # Fast device, skip CPU cost
 ```
