@@ -22,6 +22,7 @@ SD-VRAM Booster Micro-System
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
@@ -78,6 +79,15 @@ class SDVRAMSystem:
         self._vram_bytes: int = 0
         self._ram_bytes: int = 0
         self._start_time: float = 0.0
+
+        # ── 真實資料搬移基礎設施 ──
+        from ..core.mmap_swap import SwapFileManager
+        self._swap_mgr: Optional[SwapFileManager] = None
+        # RAM 層的 tensor buffer: block_id → bytearray
+        self._ram_buffers: Dict[str, bytearray] = {}
+        # block_id → swap block index 映射
+        self._ext_block_map: Dict[str, int] = {}
+        self._next_swap_block: int = 0
 
     # ── Public Lifecycle API ──
 
@@ -153,6 +163,33 @@ class SDVRAMSystem:
             return False
 
         ext_bytes = self._device.available_bytes
+
+        # 1b. 在 SD 卡上建立 mmap swap file
+        device_path = self._selected_device.device_path
+        if device_path and os.path.isdir(device_path.rstrip("\\")):
+            swap_dir = device_path.rstrip("\\")
+        else:
+            swap_dir = None
+
+        if swap_dir:
+            from ..core.mmap_swap import SwapFileManager
+            swap_path = os.path.join(swap_dir, "vram_boost.swap")
+            # 使用 80% 的可用空間，64MB block size
+            swap_size = int(ext_bytes * 0.8)
+            block_size = 64 * 1024 * 1024  # 64 MB
+            try:
+                self._swap_mgr = SwapFileManager(block_size=block_size)
+                self._swap_mgr.create(swap_path, swap_size)
+                self._swap_mgr.open()
+                # 預先映射所有 block
+                for bid in range(self._swap_mgr.total_blocks):
+                    self._swap_mgr.map_block(bid)
+                logger.info("Swap file ready: %s (%d blocks of %dMB)",
+                            swap_path, self._swap_mgr.total_blocks,
+                            block_size // (1024 * 1024))
+            except Exception as e:
+                logger.warning("Failed to create swap file: %s", e)
+                self._swap_mgr = None
 
         # 2. 建立三層記憶體池
         ram_pool = min(self._ram_bytes // 2, 32 * (1024**3))  # 最多用 50% RAM 或 32GB
@@ -396,21 +433,68 @@ class SDVRAMSystem:
     # ── Internal Handlers ──
 
     def _handle_transfer(self, block_id: str, src: MemoryTier, dst: MemoryTier, size: int) -> bool:
-        """處理記憶體層級間的資料傳輸"""
-        # EXTERNAL 層的讀寫透過 SD Express 裝置
-        if src == MemoryTier.EXTERNAL:
-            try:
-                self._device.read_block(block_id, 0, min(size, 4096))
-                return True
-            except Exception:
-                return False
-        elif dst == MemoryTier.EXTERNAL:
-            try:
-                self._device.write_block(block_id, 0, b"\x00" * min(size, 4096))
-                return True
-            except Exception:
-                return False
-        return True  # RAM ↔ VRAM 由 CUDA API 處理
+        """
+        處理記憶體層級間的真實資料傳輸。
+
+        資料流:
+          RAM → EXTERNAL: 從 _ram_buffers 讀取 → 寫入 mmap swap file
+          EXTERNAL → RAM: 從 mmap swap file 讀取 → 存入 _ram_buffers
+          RAM ↔ VRAM: 由 CUDA API 處理 (cudaMemcpy)
+        """
+        if dst == MemoryTier.EXTERNAL:
+            # RAM → EXTERNAL: 寫入 SD 卡
+            data = self._ram_buffers.get(block_id)
+            if data is None:
+                # 沒有 RAM buffer — 寫零 (初始化場景)
+                data = bytearray(size)
+
+            if self._swap_mgr is not None:
+                # 分配 swap block
+                if block_id not in self._ext_block_map:
+                    if self._next_swap_block >= self._swap_mgr.total_blocks:
+                        logger.error("Swap file full, cannot write %s", block_id)
+                        return False
+                    self._ext_block_map[block_id] = self._next_swap_block
+                    self._next_swap_block += 1
+
+                swap_bid = self._ext_block_map[block_id]
+                ok = self._swap_mgr.write_block(swap_bid, bytes(data[:size]), offset=0)
+                if not ok:
+                    logger.error("Swap write failed for %s", block_id)
+                    return False
+            else:
+                # 無 swap file — fallback 到裝置直接 I/O
+                try:
+                    self._device.write_block(block_id, 0, bytes(data[:size]))
+                except Exception:
+                    return False
+
+            # 寫入成功，釋放 RAM buffer
+            self._ram_buffers.pop(block_id, None)
+            return True
+
+        elif src == MemoryTier.EXTERNAL:
+            # EXTERNAL → RAM: 從 SD 卡讀取
+            if self._swap_mgr is not None:
+                swap_bid = self._ext_block_map.get(block_id)
+                if swap_bid is None:
+                    logger.error("No swap mapping for %s", block_id)
+                    return False
+                data = self._swap_mgr.read_block(swap_bid, 0, size)
+                if data is None:
+                    logger.error("Swap read failed for %s", block_id)
+                    return False
+                self._ram_buffers[block_id] = bytearray(data)
+            else:
+                try:
+                    data = self._device.read_block(block_id, 0, size)
+                    self._ram_buffers[block_id] = bytearray(data) if data else bytearray(size)
+                except Exception:
+                    return False
+            return True
+
+        # RAM ↔ VRAM: CUDA API 處理
+        return True
 
     def _handle_migration(self, block_id: str, src: MemoryTier, dst: MemoryTier) -> bool:
         """MemoryPool 的遷移回調"""

@@ -240,8 +240,8 @@ class TestTransferEngineCompression(unittest.TestCase):
 
     def test_compression_to_external_reduces_physical_size(self):
         """
-        When writing to EXTERNAL, the I/O handler should receive
-        physical_size = logical_size // 3.
+        QATC: INT4-tagged tensors going to EXTERNAL get compressed (5.6x).
+        Untagged tensors are NOT compressed (QATC skips FP16).
         """
         engine = self._make_engine()
         handler_calls = []
@@ -253,15 +253,18 @@ class TestTransferEngineCompression(unittest.TestCase):
         engine.register_io_handler("default", mock_handler)
 
         logical_size = 64 * 1024 * 1024  # 64 MB
+        # INT4-tagged tensor: should be compressed
         req = self._make_request(
             src=MemoryTier.RAM,
             dst=MemoryTier.EXTERNAL,
             size=logical_size,
         )
+        req.data_tag = "int4_weight_layer_0"
         engine._execute_transfer(req)
 
         self.assertEqual(len(handler_calls), 1)
-        expected_physical = logical_size // 3
+        # QATC: INT4 at BW < 500 → physical = logical * 10 // 56 (~5.6x)
+        expected_physical = max(1, logical_size * 10 // 56)
         self.assertEqual(handler_calls[0], expected_physical,
                          f"Physical size should be {expected_physical}, "
                          f"got {handler_calls[0]}")
@@ -269,8 +272,7 @@ class TestTransferEngineCompression(unittest.TestCase):
 
     def test_compression_from_external_reduces_physical_size(self):
         """
-        When reading from EXTERNAL, the physical read size should also
-        be compressed: physical_size = logical_size // 3.
+        QATC: INT4-tagged reads from EXTERNAL also get compressed ratio.
         """
         engine = self._make_engine()
         handler_calls = []
@@ -287,9 +289,10 @@ class TestTransferEngineCompression(unittest.TestCase):
             dst=MemoryTier.RAM,
             size=logical_size,
         )
+        req.data_tag = "int4_weight_layer_5"
         engine._execute_transfer(req)
 
-        expected_physical = logical_size // 3
+        expected_physical = max(1, logical_size * 10 // 56)
         self.assertEqual(handler_calls[0], expected_physical)
 
     def test_no_compression_for_vram_to_ram(self):
