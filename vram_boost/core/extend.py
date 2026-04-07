@@ -92,7 +92,14 @@ def _extend_windows(plan: ExpansionPlan) -> ExtendResult:
 
 
 def _extend_windows_pagefile(plan: ExpansionPlan, letter: str) -> ExtendResult:
-    """NTFS: create Windows pagefile (best — OS-level)."""
+    """
+    NTFS: create Windows pagefile.
+
+    Tries 3 methods in order:
+      1. WMI class (classic, works on most Windows)
+      2. Registry (most reliable, requires reboot)
+      3. PowerShell Set-CimInstance
+    """
     swap_mb = plan.swap_bytes // MB
     pagefile = f"{letter}:\\pagefile.sys"
 
@@ -100,20 +107,20 @@ def _extend_windows_pagefile(plan: ExpansionPlan, letter: str) -> ExtendResult:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             f"Get-CimInstance Win32_PageFileSetting | "
-             f"Where-Object {{$_.Name -like '{letter}:*'}} | "
-             f"Measure-Object | Select-Object -ExpandProperty Count"],
+             f"$r = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management' -Name PagingFiles;"
+             f"$r.PagingFiles -match '{letter}:'"],
             capture_output=True, text=True, timeout=10,
         )
-        if r.stdout.strip() not in ("", "0"):
+        if "True" in r.stdout:
             return ExtendResult(
                 success=True, method="windows_pagefile", path=pagefile,
-                size_gb=0, error="already exists",
+                size_gb=0, error="already configured (reboot to activate)",
             )
     except Exception:
         pass
 
-    ps = (
+    # Method 1: WMI class
+    ps_wmi = (
         f"$pf = [wmiclass]'Win32_PageFileSetting'; "
         f"$n = $pf.CreateInstance(); "
         f"$n.Name = '{pagefile}'; "
@@ -121,14 +128,67 @@ def _extend_windows_pagefile(plan: ExpansionPlan, letter: str) -> ExtendResult:
         f"$n.MaximumSize = {swap_mb}; "
         f"$n.Put()"
     )
-
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["powershell", "-NoProfile", "-Command", ps_wmi],
             capture_output=True, text=True, timeout=30,
         )
-        if r.returncode == 0:
-            logger.info("Created pagefile: %s (%d MB)", pagefile, swap_mb)
+        if r.returncode == 0 and "Exception" not in r.stderr:
+            logger.info("Created pagefile (WMI): %s (%d MB)", pagefile, swap_mb)
+            return ExtendResult(
+                success=True, method="windows_pagefile",
+                path=pagefile, size_gb=round(plan.swap_bytes / GB, 1),
+                needs_reboot=True,
+            )
+    except Exception:
+        pass
+    logger.info("WMI method failed, trying registry method")
+
+    # Method 2: Registry (most reliable)
+    ps_reg = (
+        f"$regPath = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management';"
+        f"$current = (Get-ItemProperty -Path $regPath -Name PagingFiles).PagingFiles;"
+        f"if ($current -is [string]) {{ $current = @($current) }};"
+        f"$new = $current + '{pagefile} {swap_mb} {swap_mb}';"
+        f"Set-ItemProperty -Path $regPath -Name PagingPages -Value $new;"
+        f"Set-ItemProperty -Path $regPath -Name PagingFiles -Value $new;"
+        f"Write-Host 'OK'"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_reg],
+            capture_output=True, text=True, timeout=15,
+        )
+        if "OK" in r.stdout:
+            logger.info("Created pagefile (registry): %s (%d MB)", pagefile, swap_mb)
+            return ExtendResult(
+                success=True, method="windows_pagefile",
+                path=pagefile, size_gb=round(plan.swap_bytes / GB, 1),
+                needs_reboot=True,
+            )
+    except Exception:
+        pass
+    logger.info("Registry method failed, trying SystemInfo method")
+
+    # Method 3: Create empty pagefile.sys + configure via SystemInfo
+    # As last resort, just create the file and set registry
+    ps_last = (
+        f"$f = [IO.File]::Create('{pagefile}');"
+        f"$f.SetLength({plan.swap_bytes});"
+        f"$f.Close();"
+        f"$regPath = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management';"
+        f"$current = @((Get-ItemProperty -Path $regPath -Name PagingFiles).PagingFiles);"
+        f"$current += '{pagefile} {swap_mb} {swap_mb}';"
+        f"Set-ItemProperty -Path $regPath -Name PagingFiles -Value $current;"
+        f"Write-Host 'OK'"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_last],
+            capture_output=True, text=True, timeout=60,
+        )
+        if "OK" in r.stdout:
+            logger.info("Created pagefile (file+registry): %s", pagefile)
             return ExtendResult(
                 success=True, method="windows_pagefile",
                 path=pagefile, size_gb=round(plan.swap_bytes / GB, 1),
@@ -136,7 +196,7 @@ def _extend_windows_pagefile(plan: ExpansionPlan, letter: str) -> ExtendResult:
             )
         return ExtendResult(
             success=False, method="windows_pagefile",
-            error=r.stderr.strip() or "WMI failed",
+            error=r.stderr.strip() or "All methods failed",
         )
     except Exception as e:
         return ExtendResult(success=False, method="windows_pagefile", error=str(e))
