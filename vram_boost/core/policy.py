@@ -56,9 +56,12 @@ def evaluate(device: ExternalDevice, speed: SpeedResult) -> ExpansionPlan:
         )
 
     # Calculate swap size
-    speed_limit = int(speed.write_mbs * 600 * MB)   # 10 min fill time
-    capacity_limit = int(device.free_bytes * 0.8)     # 80% of free
-    swap_bytes = min(speed_limit, capacity_limit)
+    # Cap at 8GB: even Llama-405B INT4+compression = 6.8GB
+    # Larger swap wastes creation time on slow devices
+    MAX_SWAP = 8 * GB
+    speed_limit = int(speed.write_mbs * 120 * MB)    # 2 min fill time
+    capacity_limit = int(device.free_bytes * 0.5)     # 50% of free
+    swap_bytes = min(speed_limit, capacity_limit, MAX_SWAP)
 
     # Block size based on speed
     if speed.write_mbs < 30:

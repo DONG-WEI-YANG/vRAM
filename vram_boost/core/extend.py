@@ -173,7 +173,7 @@ def _extend_windows_swapfile(plan: ExpansionPlan, letter: str, fs: str) -> Exten
         chunk_path = os.path.join(swap_dir, f"swap_{chunk_idx:03d}.bin")
 
         try:
-            # Pre-allocate with zero-fill
+            # Zero-fill: safest method, avoids sparse file issues on FAT32
             fd = os.open(chunk_path, os.O_CREAT | os.O_RDWR | os.O_BINARY)
             try:
                 fill_block = b"\x00" * (4 * MB)
