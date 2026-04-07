@@ -91,6 +91,87 @@ def _request_admin_and_relaunch():
         sys.exit(1)
 
 
+def _print_device_rating(write_mbs: float):
+    """Show device tier, capabilities, and upgrade recommendations."""
+    print()
+    print("  ┌─────────────────────────────────────────────┐")
+
+    if write_mbs < 1:
+        tier = "UNUSABLE"
+        bar = "X"
+        print(f"  │  {write_mbs:>6.1f} MB/s — {tier:<14}  [{bar:<10}] │")
+        print(f"  │                                             │")
+        print(f"  │  Device too slow for any memory expansion.  │")
+        print(f"  │  Minimum: 1 MB/s                            │")
+
+    elif write_mbs < 30:
+        tier = "BASIC"
+        bar = "=" * 2
+        print(f"  │  {write_mbs:>6.1f} MB/s — {tier:<14}  [{bar:<10}] │")
+        print(f"  │                                             │")
+        print(f"  │  Capability: Emergency overflow (anti-OOM)  │")
+        print(f"  │  LLM inference: Very slow (~1-3 sec/token)  │")
+        print(f"  │                                             │")
+        print(f"  │  Upgrade suggestion:                        │")
+        print(f"  │  > USB 3.2 SSD (~$30) = 10-20x faster      │")
+        print(f"  │    Enables smooth LLM inference offload     │")
+
+    elif write_mbs < 100:
+        tier = "STANDARD"
+        bar = "=" * 4
+        print(f"  │  {write_mbs:>6.1f} MB/s — {tier:<14}  [{bar:<10}] │")
+        print(f"  │                                             │")
+        print(f"  │  Capability: Usable memory expansion        │")
+        print(f"  │  LLM inference: Moderate (~5-10 tok/s)      │")
+        print(f"  │  With INT4 compression: ~15 tok/s           │")
+        print(f"  │                                             │")
+        print(f"  │  Good for general use!                      │")
+
+    elif write_mbs < 500:
+        tier = "FAST"
+        bar = "=" * 7
+        print(f"  │  {write_mbs:>6.1f} MB/s — {tier:<14}  [{bar:<10}] │")
+        print(f"  │                                             │")
+        print(f"  │  Capability: Full LLM offload support       │")
+        print(f"  │  LLM inference: Near-native speed           │")
+        print(f"  │  With INT4 compression: compute-bound       │")
+        print(f"  │                                             │")
+        print(f"  │  Excellent device!                          │")
+
+    else:
+        tier = "ULTRA"
+        bar = "=" * 10
+        print(f"  │  {write_mbs:>6.1f} MB/s — {tier:<14}  [{bar:<10}] │")
+        print(f"  │                                             │")
+        print(f"  │  Capability: NVMe-class performance         │")
+        print(f"  │  LLM inference: Full native speed           │")
+        print(f"  │  Compression: Skipped (device fast enough)  │")
+        print(f"  │                                             │")
+        print(f"  │  Top tier — no upgrade needed!              │")
+
+    print(f"  └─────────────────────────────────────────────┘")
+
+    # Show what models can run
+    print()
+    if write_mbs >= 1:
+        eff = write_mbs * 30  # QATC effective bandwidth
+        print(f"  Effective bandwidth with INT4 compression: {eff:.0f} MB/s")
+        print()
+        print(f"  Model support at this speed:")
+        models = [
+            ("Llama-3-8B (INT4)",   4.5,  0.15),
+            ("Llama-3-70B (INT4)", 35.0,  1.17),
+            ("Mixtral 8x7B (INT4)", 24.0, 0.80),
+        ]
+        for name, raw_gb, comp_gb in models:
+            load_time = comp_gb * 1024 / write_mbs
+            if load_time < 60:
+                time_str = f"{load_time:.0f} sec load"
+            else:
+                time_str = f"{load_time/60:.1f} min load"
+            print(f"    {name:<24} {comp_gb:.2f} GB compressed  {time_str}")
+
+
 def _print_banner():
     print()
     print("  ╔══════════════════════════════════════╗")
@@ -126,14 +207,14 @@ def main():
     config = _load_config(drive)
     print(f"  Config: max_swap={config['max_swap_percent']}%, auto={config['auto_expand']}")
 
-    # Step 3: Speed test
+    # Step 3: Speed test + device rating
     print(f"\n  Testing write speed...")
     speed = measure_write_speed(drive)
     print(f"  Write speed: {speed.write_mbs} MB/s")
+    _print_device_rating(speed.write_mbs)
 
     if not speed.is_usable:
-        print(f"\n  Device too slow ({speed.write_mbs} MB/s). Exiting.")
-        input("  Press Enter to close...")
+        input("\n  Press Enter to close...")
         return
 
     # Step 4: Evaluate
